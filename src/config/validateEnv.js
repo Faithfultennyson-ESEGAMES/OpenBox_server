@@ -3,6 +3,7 @@ import config from '../config.js';
 export function validateEnv() {
   const requiredPositiveInts = [
     ['FIRST_JOIN_TIMEOUT_MS', config.firstJoinTimeoutMs],
+    ['READY_CHECK_TIMEOUT_MS', config.readyCheckTimeoutMs],
     ['DISTRIBUTION_BUFFER_MS', config.distributionBufferMs],
     ['SWAP_PHASE_MS', config.swapPhaseMs],
     ['PRE_RESULT_READY_TIMEOUT_MS', config.preResultReadyTimeoutMs],

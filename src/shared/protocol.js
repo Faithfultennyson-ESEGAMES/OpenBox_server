@@ -10,6 +10,7 @@ export const SessionStatus = Object.freeze({
 export const RoundStatus = Object.freeze({
   WAITING_FOR_FIRST_JOIN: 'WAITING_FOR_FIRST_JOIN',
   JOIN_WINDOW_OPEN: 'JOIN_WINDOW_OPEN',
+  READY_CHECK: 'READY_CHECK',
   DISTRIBUTING: 'DISTRIBUTING',
   SWAP_OPEN: 'SWAP_OPEN',
   SWAP_CLOSED: 'SWAP_CLOSED',
@@ -37,6 +38,7 @@ export const ParticipationLabel = Object.freeze({
 export const ClientMessageType = Object.freeze({
   HELLO: 'HELLO',
   PONG: 'PONG',
+  ROUND_READY: 'ROUND_READY',
   SWAP_REQUEST: 'SWAP_REQUEST',
   KEEP_BOX: 'KEEP_BOX',
   PRE_RESULT_READY: 'PRE_RESULT_READY'
@@ -46,6 +48,7 @@ export const ServerMessageType = Object.freeze({
   WELCOME: 'WELCOME',
   SESSION_SNAPSHOT: 'SESSION_SNAPSHOT',
   JOIN_WINDOW_STARTED: 'JOIN_WINDOW_STARTED',
+  READY_CHECK_STARTED: 'READY_CHECK_STARTED',
   ROUND_STARTED: 'ROUND_STARTED',
   BOX_ASSIGNED: 'BOX_ASSIGNED',
   SWAP_WINDOW_OPEN: 'SWAP_WINDOW_OPEN',

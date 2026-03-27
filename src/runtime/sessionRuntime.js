@@ -41,6 +41,7 @@ export class SessionRuntime {
     this.connections = new Map();
     this.timers = {
       joinDeadline: null,
+      readyCheck: null,
       distribution: null,
       swapSoftLock: null,
       swapClose: null,
@@ -250,7 +251,7 @@ export class SessionRuntime {
     await this.broadcastSnapshots();
 
     if (this.getJoinedCount() === this.round.expectedPlayerCountForRound) {
-      await this.startRound('all_players_joined');
+      await this.enterReadyCheck('all_players_joined');
     }
 
     return {
@@ -327,6 +328,87 @@ export class SessionRuntime {
     }, delay);
   }
 
+  async enterReadyCheck(reason = 'all_players_joined') {
+    if (this.round.status !== RoundStatus.JOIN_WINDOW_OPEN) {
+      return;
+    }
+
+    this.clearTimer('joinDeadline');
+    this.clearTimer('readyCheck');
+
+    const readyCheckStartedAt = Date.now();
+    this.round.status = RoundStatus.READY_CHECK;
+    this.round.gatePlayerIdsForRound = [...this.round.registeredPlayerIdsForRound];
+    this.round.readyPlayerIdsForRound = [];
+    this.round.readyCheckStartedAt = readyCheckStartedAt;
+    this.round.readyCheckDeadlineAt = readyCheckStartedAt + config.readyCheckTimeoutMs;
+
+    for (const player of this.players) {
+      player.isReadyForRound = false;
+    }
+
+    await this.persistVisibleState();
+    this.broadcast(ServerMessageType.READY_CHECK_STARTED, {
+      roundId: this.round.roundId,
+      roundNumber: this.round.roundNumber,
+      reason,
+      readyCheckStartedAt: this.round.readyCheckStartedAt,
+      readyCheckDeadlineAt: this.round.readyCheckDeadlineAt,
+      expectedReadyPlayerCount: this.round.gatePlayerIdsForRound.length
+    });
+    await this.broadcastSnapshots();
+
+    this.timers.readyCheck = setTimeout(() => {
+      this.handleReadyCheckDeadline().catch((error) => console.error(error));
+    }, Math.max(0, this.round.readyCheckDeadlineAt - Date.now()));
+  }
+
+  async handleRoundReady(playerId) {
+    if (this.round.status !== RoundStatus.READY_CHECK) {
+      return { ok: false, error: 'ROUND_NOT_WAITING_FOR_READY' };
+    }
+
+    if (!this.round.gatePlayerIdsForRound.includes(playerId)) {
+      return { ok: false, error: 'PLAYER_NOT_ELIGIBLE_FOR_READY' };
+    }
+
+    const player = findPlayer(this.players, playerId);
+    if (!player) {
+      return { ok: false, error: 'PLAYER_NOT_REGISTERED' };
+    }
+
+    if (this.round.readyPlayerIdsForRound.includes(playerId)) {
+      return { ok: true, alreadyReady: true };
+    }
+
+    player.isReadyForRound = true;
+    player.lastSeenAt = Date.now();
+    this.round.readyPlayerIdsForRound.push(playerId);
+    await this.persistVisibleState();
+    await this.broadcastSnapshots();
+
+    if (this.round.readyPlayerIdsForRound.length >= this.round.gatePlayerIdsForRound.length) {
+      await this.startRound('all_players_ready');
+    }
+
+    return { ok: true, alreadyReady: false };
+  }
+
+  async handleReadyCheckDeadline() {
+    if (this.round.status !== RoundStatus.READY_CHECK) return;
+
+    for (const player of this.players) {
+      if (!this.round.gatePlayerIdsForRound.includes(player.playerId)) continue;
+      if (this.round.readyPlayerIdsForRound.includes(player.playerId)) continue;
+      player.isReadyForRound = true;
+      this.round.readyPlayerIdsForRound.push(player.playerId);
+    }
+
+    await this.persistVisibleState();
+    await this.broadcastSnapshots();
+    await this.startRound('ready_timeout_elapsed');
+  }
+
   async handleJoinDeadline() {
     if (config.devWaitForAllPlayers) return;
 
@@ -371,11 +453,12 @@ export class SessionRuntime {
   }
 
   async startRound(reason) {
-    if (![RoundStatus.JOIN_WINDOW_OPEN, RoundStatus.WAITING_FOR_FIRST_JOIN].includes(this.round.status)) {
+    if (![RoundStatus.JOIN_WINDOW_OPEN, RoundStatus.WAITING_FOR_FIRST_JOIN, RoundStatus.READY_CHECK].includes(this.round.status)) {
       return;
     }
 
     this.clearTimer('joinDeadline');
+    this.clearTimer('readyCheck');
 
     const allocation = buildBoxes({
       registeredPlayerIds: this.round.registeredPlayerIdsForRound,
@@ -395,6 +478,7 @@ export class SessionRuntime {
     for (const player of this.players) {
       const ownedBox = this.boxes.find((box) => box.initialOwnerPlayerId === player.playerId);
       player.connectedAtStartOfRound = player.isConnected;
+      player.isReadyForRound = false;
       player.assignedBoxId = ownedBox?.boxId || null;
       player.currentBoxId = ownedBox?.boxId || null;
       player.initialBoxId = ownedBox?.boxId || null;
@@ -419,6 +503,10 @@ export class SessionRuntime {
       }) + config.distributionBufferMs;
 
     this.round.status = RoundStatus.DISTRIBUTING;
+    this.round.gatePlayerIdsForRound = [];
+    this.round.readyCheckStartedAt = null;
+    this.round.readyCheckDeadlineAt = null;
+    this.round.readyPlayerIdsForRound = [];
     this.round.distributionStartedAt = distributionStartedAt;
     this.round.distributionEndsAt = distributionStartedAt + distributionDurationMs;
     this.round.swapStartedAt = null;
@@ -834,6 +922,11 @@ export class SessionRuntime {
         }
         return;
       }
+      case ClientMessageType.ROUND_READY: {
+        const result = await this.handleRoundReady(ws.playerId);
+        if (!result.ok) sendError(ws, result.error, 'Unable to mark player ready');
+        return;
+      }
       case ClientMessageType.SWAP_REQUEST: {
         const result = await this.handleSwapRequest(ws.playerId);
         if (!result.ok) sendError(ws, result.error, 'Unable to request swap');
@@ -947,6 +1040,18 @@ export class SessionRuntime {
 
     if (this.round.status === RoundStatus.JOIN_WINDOW_OPEN && this.round.joinDeadlineAt) {
       this.scheduleJoinDeadline();
+      return;
+    }
+
+    if (this.round.status === RoundStatus.READY_CHECK && this.round.readyCheckDeadlineAt) {
+      this.clearTimer('readyCheck');
+      if (Date.now() >= this.round.readyCheckDeadlineAt) {
+        await this.handleReadyCheckDeadline();
+      } else {
+        this.timers.readyCheck = setTimeout(() => {
+          this.handleReadyCheckDeadline().catch((error) => console.error(error));
+        }, Math.max(0, this.round.readyCheckDeadlineAt - Date.now()));
+      }
       return;
     }
 

@@ -48,6 +48,24 @@ function withWebhookCapture(t) {
   return events;
 }
 
+async function joinPlayers(runtime, playerIds) {
+  for (const playerId of playerIds) {
+    await runtime.markJoinIntent({ playerId, playerName: playerId });
+  }
+}
+
+async function readyPlayers(runtime, playerIds) {
+  for (const playerId of playerIds) {
+    await runtime.handleRoundReady(playerId);
+  }
+}
+
+async function joinAndReadyAll(runtime, playerIds) {
+  await joinPlayers(runtime, playerIds);
+  assert.equal(runtime.round.status, RoundStatus.READY_CHECK);
+  await readyPlayers(runtime, playerIds);
+}
+
 test('first join intent starts the join window countdown', async (t) => {
   withStubbedStore(t);
   withConfigOverride(t, 'devWaitForAllPlayers', false);
@@ -82,7 +100,7 @@ test('join deadline below minimum cancels the session', async (t) => {
   assert.equal(stub.calls.some((entry) => entry[0] === 'releasePlayerActiveSession'), true);
 });
 
-test('dev wait mode keeps the join window open until all players join, then enters distributing', async (t) => {
+test('dev wait mode keeps the join window open until all players join, then enters ready check before distributing', async (t) => {
   withStubbedStore(t);
   withConfigOverride(t, 'devWaitForAllPlayers', true);
   const { runtime } = await createRuntimeFixture();
@@ -95,16 +113,15 @@ test('dev wait mode keeps the join window open until all players join, then ente
   assert.equal(runtime.round.joinDeadlineAt, null);
   assert.equal(runtime.timers.joinDeadline, null);
 
-  for (const playerId of ['p2', 'p3', 'p4', 'p5']) {
-    await runtime.markJoinIntent({ playerId, playerName: playerId });
-  }
-
+  await joinPlayers(runtime, ['p2', 'p3', 'p4', 'p5']);
+  assert.equal(runtime.round.status, RoundStatus.READY_CHECK);
+  await readyPlayers(runtime, ['p1', 'p2', 'p3', 'p4', 'p5']);
   assert.equal(runtime.round.status, RoundStatus.DISTRIBUTING);
   assert.ok(runtime.round.distributionStartedAt > 0);
   assert.ok(runtime.round.distributionEndsAt > runtime.round.distributionStartedAt);
 });
 
-test('join success enters distributing directly with 2D timestamps', async (t) => {
+test('join success enters ready check and then distributing with 2D timestamps', async (t) => {
   withStubbedStore(t);
   withConfigOverride(t, 'devWaitForAllPlayers', false);
   const { runtime } = await createRuntimeFixture();
@@ -113,10 +130,10 @@ test('join success enters distributing directly with 2D timestamps', async (t) =
   await runtime.handleHello(createFakeSocket(), { playerId: 'p1', playerName: 'Alice' });
   await runtime.handleHello(createFakeSocket(), { playerId: 'p2', playerName: 'Bob' });
 
-  for (const playerId of ['p1', 'p2', 'p3', 'p4', 'p5']) {
-    await runtime.markJoinIntent({ playerId, playerName: playerId });
-  }
-
+  await joinPlayers(runtime, ['p1', 'p2', 'p3', 'p4', 'p5']);
+  assert.equal(runtime.round.status, RoundStatus.READY_CHECK);
+  assert.equal(runtime.round.readyPlayerIdsForRound.length, 0);
+  await readyPlayers(runtime, ['p1', 'p2', 'p3', 'p4', 'p5']);
   assert.equal(runtime.round.status, RoundStatus.DISTRIBUTING);
   assert.equal(runtime.round.grossStakeTotal, 5000);
   assert.ok(runtime.round.distributionStartedAt > 0);
@@ -129,9 +146,7 @@ test('late join intent after round start is accepted without mutating joined cou
   const { runtime } = await createRuntimeFixture({ playerIds: ['p1', 'p2', 'p3', 'p4', 'p5', 'p6'] });
   t.after(() => clearRuntimeTimers(runtime));
 
-  for (const playerId of ['p1', 'p2', 'p3', 'p4', 'p5']) {
-    await runtime.markJoinIntent({ playerId, playerName: playerId });
-  }
+  await joinPlayers(runtime, ['p1', 'p2', 'p3', 'p4', 'p5']);
   await runtime.startRound('test');
 
   const joinedCountBefore = runtime.getJoinedCount();
@@ -148,9 +163,7 @@ test('startRound counts absent registered players in the economy and assignment'
   const { runtime } = await createRuntimeFixture({ playerIds: ['p1', 'p2', 'p3', 'p4', 'p5', 'p6'] });
   t.after(() => clearRuntimeTimers(runtime));
 
-  for (const playerId of ['p1', 'p2', 'p3', 'p4', 'p5']) {
-    await runtime.markJoinIntent({ playerId, playerName: playerId });
-  }
+  await joinPlayers(runtime, ['p1', 'p2', 'p3', 'p4', 'p5']);
   await runtime.startRound('test');
 
   assert.equal(runtime.round.status, RoundStatus.DISTRIBUTING);
@@ -206,9 +219,7 @@ test('swap window computes the soft lock cutoff from total swap time and percent
   const { runtime } = await createRuntimeFixture();
   t.after(() => clearRuntimeTimers(runtime));
 
-  for (const playerId of ['p1', 'p2', 'p3', 'p4', 'p5']) {
-    await runtime.markJoinIntent({ playerId, playerName: playerId });
-  }
+  await joinAndReadyAll(runtime, ['p1', 'p2', 'p3', 'p4', 'p5']);
   await runtime.openSwapWindow();
 
   assert.equal(runtime.round.status, RoundStatus.SWAP_OPEN);
@@ -221,9 +232,7 @@ test('swap flow supports pending, matched, and keep states', async (t) => {
   const { runtime } = await createRuntimeFixture();
   t.after(() => clearRuntimeTimers(runtime));
 
-  for (const playerId of ['p1', 'p2', 'p3', 'p4', 'p5']) {
-    await runtime.markJoinIntent({ playerId, playerName: playerId });
-  }
+  await joinAndReadyAll(runtime, ['p1', 'p2', 'p3', 'p4', 'p5']);
   await runtime.openSwapWindow();
 
   const pending = await runtime.handleSwapRequest('p1');
@@ -250,9 +259,7 @@ test('matched swap broadcasts the success outcome and snapshot box number', asyn
   await runtime.handleHello(ws1, { playerId: 'p1', playerName: 'Alice' });
   await runtime.handleHello(ws2, { playerId: 'p2', playerName: 'Bob' });
 
-  for (const playerId of ['p1', 'p2', 'p3', 'p4', 'p5']) {
-    await runtime.markJoinIntent({ playerId, playerName: playerId });
-  }
+  await joinAndReadyAll(runtime, ['p1', 'p2', 'p3', 'p4', 'p5']);
   const initialP1Box = runtime.players.find((player) => player.playerId === 'p1').currentBoxId;
   const initialP2Box = runtime.players.find((player) => player.playerId === 'p2').currentBoxId;
   await runtime.openSwapWindow();
@@ -287,9 +294,7 @@ test('soft lock resolves pending swaps to unmatched and auto-keeps untouched pla
   const { runtime } = await createRuntimeFixture();
   t.after(() => clearRuntimeTimers(runtime));
 
-  for (const playerId of ['p1', 'p2', 'p3', 'p4', 'p5']) {
-    await runtime.markJoinIntent({ playerId, playerName: playerId });
-  }
+  await joinAndReadyAll(runtime, ['p1', 'p2', 'p3', 'p4', 'p5']);
   await runtime.openSwapWindow();
   await runtime.handleSwapRequest('p1');
   const result = await runtime.applySwapSoftLock();
@@ -306,9 +311,7 @@ test('swap request still fails after the soft-lock cutoff', async (t) => {
   const { runtime } = await createRuntimeFixture();
   t.after(() => clearRuntimeTimers(runtime));
 
-  for (const playerId of ['p1', 'p2', 'p3', 'p4', 'p5']) {
-    await runtime.markJoinIntent({ playerId, playerName: playerId });
-  }
+  await joinAndReadyAll(runtime, ['p1', 'p2', 'p3', 'p4', 'p5']);
   await runtime.openSwapWindow();
   runtime.round.swapActionClosesAt = Date.now() - 1;
 
@@ -323,9 +326,7 @@ test('closeSwapWindow preserves unmatched soft-lock outcomes and ends the swap w
   const { runtime } = await createRuntimeFixture();
   t.after(() => clearRuntimeTimers(runtime));
 
-  for (const playerId of ['p1', 'p2', 'p3', 'p4', 'p5']) {
-    await runtime.markJoinIntent({ playerId, playerName: playerId });
-  }
+  await joinAndReadyAll(runtime, ['p1', 'p2', 'p3', 'p4', 'p5']);
   await runtime.openSwapWindow();
   await runtime.handleSwapRequest('p1');
   await runtime.applySwapSoftLock();
@@ -349,9 +350,7 @@ test('soft lock broadcasts the no-match outcome before reveal starts', async (t)
   const ws = createFakeSocket();
   await runtime.handleHello(ws, { playerId: 'p1', playerName: 'Alice' });
 
-  for (const playerId of ['p1', 'p2', 'p3', 'p4', 'p5']) {
-    await runtime.markJoinIntent({ playerId, playerName: playerId });
-  }
+  await joinAndReadyAll(runtime, ['p1', 'p2', 'p3', 'p4', 'p5']);
   await runtime.openSwapWindow();
   ws.sent = [];
 
@@ -376,9 +375,7 @@ test('swap end does not change already-settled unmatched outcomes after soft loc
   const ws = createFakeSocket();
   await runtime.handleHello(ws, { playerId: 'p1', playerName: 'Alice' });
 
-  for (const playerId of ['p1', 'p2', 'p3', 'p4', 'p5']) {
-    await runtime.markJoinIntent({ playerId, playerName: playerId });
-  }
+  await joinAndReadyAll(runtime, ['p1', 'p2', 'p3', 'p4', 'p5']);
   await runtime.openSwapWindow();
   ws.sent = [];
 
@@ -401,9 +398,7 @@ test('entering reveal starts the pre-result barrier immediately and counts only 
   const ws = createFakeSocket();
   await runtime.handleHello(ws, { playerId: 'p1', playerName: 'Alice' });
 
-  for (const playerId of ['p1', 'p2', 'p3', 'p4', 'p5']) {
-    await runtime.markJoinIntent({ playerId, playerName: playerId });
-  }
+  await joinAndReadyAll(runtime, ['p1', 'p2', 'p3', 'p4', 'p5']);
   await runtime.openSwapWindow();
   await runtime.closeSwapWindow();
 
@@ -424,9 +419,7 @@ test('duplicate PRE_RESULT_READY is idempotent and release waits for the configu
   const ws = createFakeSocket();
   await runtime.handleHello(ws, { playerId: 'p1', playerName: 'Alice' });
 
-  for (const playerId of ['p1', 'p2', 'p3', 'p4', 'p5']) {
-    await runtime.markJoinIntent({ playerId, playerName: playerId });
-  }
+  await joinAndReadyAll(runtime, ['p1', 'p2', 'p3', 'p4', 'p5']);
   await runtime.openSwapWindow();
   await runtime.closeSwapWindow();
 
@@ -468,9 +461,7 @@ test('disconnect during the pre-result barrier removes the player from the block
   const ws = createFakeSocket();
   await runtime.handleHello(ws, { playerId: 'p1', playerName: 'Alice' });
 
-  for (const playerId of ['p1', 'p2', 'p3', 'p4', 'p5']) {
-    await runtime.markJoinIntent({ playerId, playerName: playerId });
-  }
+  await joinAndReadyAll(runtime, ['p1', 'p2', 'p3', 'p4', 'p5']);
   await runtime.openSwapWindow();
   await runtime.closeSwapWindow();
   await runtime.handleDisconnect('p1');
@@ -488,9 +479,7 @@ test('pre-result timeout falls back to release even if some clients never report
   const ws = createFakeSocket();
   await runtime.handleHello(ws, { playerId: 'p1', playerName: 'Alice' });
 
-  for (const playerId of ['p1', 'p2', 'p3', 'p4', 'p5']) {
-    await runtime.markJoinIntent({ playerId, playerName: playerId });
-  }
+  await joinAndReadyAll(runtime, ['p1', 'p2', 'p3', 'p4', 'p5']);
   await runtime.openSwapWindow();
   await runtime.closeSwapWindow();
 

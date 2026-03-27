@@ -237,6 +237,8 @@ async function handleActiveSessions(req, res) {
       roundStatus: runtime.round?.status || null,
       playerCount: runtime.session.currentExpectedPlayerCount,
       joinedCount: runtime.getJoinedCount(),
+      readyCount: runtime.round?.readyPlayerIdsForRound?.length || 0,
+      expectedReadyCount: runtime.round?.gatePlayerIdsForRound?.length || 0,
       connectedCount: runtime.players.filter((player) => player.isConnected).length,
       createdAt: runtime.session.createdAt,
       endedAt: runtime.session.endedAt || null,

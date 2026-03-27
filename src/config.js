@@ -63,6 +63,7 @@ export const config = {
   redisKeyTtlSec: toInt(process.env.REDIS_KEY_TTL_SEC, 86400),
   devWaitForAllPlayers: toBool(process.env.DEV_WAIT_FOR_ALL_PLAYERS, false),
   firstJoinTimeoutMs: toInt(process.env.FIRST_JOIN_TIMEOUT_MS, 30000),
+  readyCheckTimeoutMs: toInt(process.env.READY_CHECK_TIMEOUT_MS, 10000),
   distributionBufferMs: toInt(process.env.DISTRIBUTION_BUFFER_MS, 1500),
   swapPhaseMs: toInt(process.env.SWAP_PHASE_MS, 30000),
   swapSoftLockPercent: toInt(process.env.SWAP_SOFT_LOCK_PERCENT, 30),
