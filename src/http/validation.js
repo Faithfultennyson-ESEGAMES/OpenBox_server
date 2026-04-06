@@ -3,8 +3,8 @@ export function validateStartPayload(body) {
   const stakeAmount = Number.parseFloat(body?.stakeAmount);
   const playerIds = Array.isArray(body?.playerIds) ? body.playerIds.map(String) : [];
 
-  if (!Number.isFinite(playerCount) || playerCount < 5 || playerCount > 50) {
-    return { ok: false, error: 'playerCount must be between 5 and 50' };
+  if (!Number.isFinite(playerCount) || playerCount < 2 || playerCount > 50) {
+    return { ok: false, error: 'playerCount must be between 2 and 50' };
   }
   if (playerIds.length !== playerCount) {
     return { ok: false, error: 'playerIds length must match playerCount' };

@@ -2,7 +2,7 @@ import crypto from 'node:crypto';
 import { calculateFee } from '../domain/fees.js';
 
 export const WEBHOOK_EVENT_VERSION = 1;
-export const MINIMUM_PLAYERS_TO_START = 5;
+export const MINIMUM_PLAYERS_TO_START = 2;
 
 function roundStatusLabel(status) {
   switch (status) {
@@ -380,6 +380,8 @@ export function buildRoundStartedPayload({ eventName, session, round, players, b
     rewardPool: economy.rewardPool,
     distributionStartedAt: round.distributionStartedAt ?? null,
     distributionEndsAt: round.distributionEndsAt ?? null,
+    distributionPackage: round.distributionPackage ?? null,
+    swapPackage: round.swapPackage ?? null,
     players: (players || []).map((player) => buildPlayerRoundState(player)),
     boxes: (boxes || []).map((box) => buildBoxState(box))
   });
@@ -411,7 +413,13 @@ export function buildRoundSwapMatchedPayload({ eventName, session, round, player
   });
 }
 
-export function buildRoundCancelledPayload({ eventName, session, round, players, minimumPlayersRequired = MINIMUM_PLAYERS_TO_START }) {
+export function buildRoundCancelledPayload({
+  eventName,
+  session,
+  round,
+  players,
+  minimumPlayersRequired = MINIMUM_PLAYERS_TO_START
+}) {
   return buildEnvelope(eventName, {
     sessionId: session.sessionId,
     roundId: round.roundId,
@@ -448,6 +456,10 @@ export function buildRoundEndedPayload({ eventName, session, round, players, box
     swapEndsAt: round.swapEndsAt ?? null,
     swapClosedAt: round.swapClosedAt ?? null,
     revealAt: round.revealAt ?? null,
+    distributionPackage: round.distributionPackage ?? null,
+    swapPackage: round.swapPackage ?? null,
+    revealPackage: round.revealPackage ?? null,
+    resultsPackage: round.resultsPackage ?? null,
     preResultStartedAt: round.preResultStartedAt ?? null,
     preResultReadyDeadlineAt: round.preResultReadyDeadlineAt ?? null,
     finalResultsReleaseAt: round.finalResultsReleaseAt ?? null,

@@ -36,34 +36,26 @@ export const ParticipationLabel = Object.freeze({
 });
 
 export const ClientMessageType = Object.freeze({
-  HELLO: 'HELLO',
-  PONG: 'PONG',
-  ROUND_READY: 'ROUND_READY',
-  SWAP_REQUEST: 'SWAP_REQUEST',
-  KEEP_BOX: 'KEEP_BOX',
-  PRE_RESULT_READY: 'PRE_RESULT_READY'
+  HELLO: 'hello',
+  PONG: 'pong',
+  ROUND_READY: 'ready_up',
+  SWAP_REQUEST: 'swap_request',
+  KEEP_BOX: 'keep_box',
+  TIMER_END: 'timer_end',
+  LEADERBOARD_REQUEST: 'leaderboard_request'
 });
 
 export const ServerMessageType = Object.freeze({
-  WELCOME: 'WELCOME',
-  SESSION_SNAPSHOT: 'SESSION_SNAPSHOT',
-  JOIN_WINDOW_STARTED: 'JOIN_WINDOW_STARTED',
-  READY_CHECK_STARTED: 'READY_CHECK_STARTED',
-  ROUND_STARTED: 'ROUND_STARTED',
-  BOX_ASSIGNED: 'BOX_ASSIGNED',
-  SWAP_WINDOW_OPEN: 'SWAP_WINDOW_OPEN',
-  SWAP_PENDING: 'SWAP_PENDING',
-  SWAP_MATCHED: 'SWAP_MATCHED',
-  SWAP_UNMATCHED: 'SWAP_UNMATCHED',
-  SWAP_WINDOW_CLOSED: 'SWAP_WINDOW_CLOSED',
-  REVEAL_START: 'REVEAL_START',
-  PLAYER_RESULT: 'PLAYER_RESULT',
-  ROUND_RESULTS: 'ROUND_RESULTS',
-  REPLAY_WAITING: 'REPLAY_WAITING',
-  REPLAY_ACCEPTED: 'REPLAY_ACCEPTED',
-  SESSION_ENDED: 'SESSION_ENDED',
-  ERROR: 'ERROR',
-  PING: 'PING'
+  WELCOME: 'welcome',
+  READY_STATUS: 'ready_status',
+  SESSION_INIT: 'session_init',
+  REPLAY_STARTED: 'replay_started',
+  SWAP_RESULT: 'swap_result',
+  SOFTLOCK: 'softlock',
+  ROUND_RESULT: 'round_result',
+  LEADERBOARD_DATA: 'leaderboard_data',
+  ERROR: 'error',
+  PING: 'ping'
 });
 
 export const WebhookEventType = Object.freeze({

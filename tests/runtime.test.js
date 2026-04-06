@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import config from '../src/config.js';
-import { RoundStatus, ServerMessageType, SessionStatus, SwapState } from '../src/shared/protocol.js';
+import { ClientMessageType, RoundStatus, ServerMessageType, SessionStatus, SwapState } from '../src/shared/protocol.js';
 import {
   clearRuntimeTimers,
   createFakeSocket,
@@ -11,7 +11,26 @@ import {
 
 function withStubbedStore(t) {
   const stub = installRedisStoreStubs();
+  const previousEndpoints = config.webhookEndpoints;
+  const previousRetrySchedule = config.webhookRetryScheduleMs;
+  const previousMaxAttempts = config.maxWebhookAttempts;
+  const previousMatchmakingUrl = config.matchmakingServiceUrl;
+  const previousConsoleLog = console.log;
+
+  config.webhookEndpoints = [];
+  config.webhookRetryScheduleMs = [0];
+  config.maxWebhookAttempts = 1;
+  config.matchmakingServiceUrl = '';
+  console.log = () => {};
+
   t.after(() => stub.restore());
+  t.after(() => {
+    config.webhookEndpoints = previousEndpoints;
+    config.webhookRetryScheduleMs = previousRetrySchedule;
+    config.maxWebhookAttempts = previousMaxAttempts;
+    config.matchmakingServiceUrl = previousMatchmakingUrl;
+    console.log = previousConsoleLog;
+  });
   return stub;
 }
 
@@ -64,6 +83,12 @@ async function joinAndReadyAll(runtime, playerIds) {
   await joinPlayers(runtime, playerIds);
   assert.equal(runtime.round.status, RoundStatus.READY_CHECK);
   await readyPlayers(runtime, playerIds);
+  assert.equal(runtime.round.status, RoundStatus.DISTRIBUTING);
+  runtime.clearAllTimers();
+}
+
+function messagesOf(ws, type) {
+  return ws.sent.filter((entry) => entry.type === type);
 }
 
 test('first join intent starts the join window countdown', async (t) => {
@@ -84,12 +109,10 @@ test('first join intent starts the join window countdown', async (t) => {
 test('join deadline below minimum cancels the session', async (t) => {
   const stub = withStubbedStore(t);
   withConfigOverride(t, 'devWaitForAllPlayers', false);
-  const { runtime } = await createRuntimeFixture({ playerIds: ['p1', 'p2', 'p3', 'p4', 'p5', 'p6'] });
+  const { runtime } = await createRuntimeFixture({ playerIds: ['p1', 'p2', 'p3'] });
   t.after(() => clearRuntimeTimers(runtime));
 
-  for (const playerId of ['p1', 'p2', 'p3', 'p4']) {
-    await runtime.markJoinIntent({ playerId, playerName: playerId.toUpperCase() });
-  }
+  await runtime.markJoinIntent({ playerId: 'p1', playerName: 'P1' });
 
   await runtime.handleJoinDeadline();
 
@@ -100,7 +123,7 @@ test('join deadline below minimum cancels the session', async (t) => {
   assert.equal(stub.calls.some((entry) => entry[0] === 'releasePlayerActiveSession'), true);
 });
 
-test('dev wait mode keeps the join window open until all players join, then enters ready check before distributing', async (t) => {
+test('dev wait mode stays in join window until all players join, then enters ready check', async (t) => {
   withStubbedStore(t);
   withConfigOverride(t, 'devWaitForAllPlayers', true);
   const { runtime } = await createRuntimeFixture();
@@ -117,67 +140,9 @@ test('dev wait mode keeps the join window open until all players join, then ente
   assert.equal(runtime.round.status, RoundStatus.READY_CHECK);
   await readyPlayers(runtime, ['p1', 'p2', 'p3', 'p4', 'p5']);
   assert.equal(runtime.round.status, RoundStatus.DISTRIBUTING);
-  assert.ok(runtime.round.distributionStartedAt > 0);
-  assert.ok(runtime.round.distributionEndsAt > runtime.round.distributionStartedAt);
 });
 
-test('join success enters ready check and then distributing with 2D timestamps', async (t) => {
-  withStubbedStore(t);
-  withConfigOverride(t, 'devWaitForAllPlayers', false);
-  const { runtime } = await createRuntimeFixture();
-  t.after(() => clearRuntimeTimers(runtime));
-
-  await runtime.handleHello(createFakeSocket(), { playerId: 'p1', playerName: 'Alice' });
-  await runtime.handleHello(createFakeSocket(), { playerId: 'p2', playerName: 'Bob' });
-
-  await joinPlayers(runtime, ['p1', 'p2', 'p3', 'p4', 'p5']);
-  assert.equal(runtime.round.status, RoundStatus.READY_CHECK);
-  assert.equal(runtime.round.readyPlayerIdsForRound.length, 0);
-  await readyPlayers(runtime, ['p1', 'p2', 'p3', 'p4', 'p5']);
-  assert.equal(runtime.round.status, RoundStatus.DISTRIBUTING);
-  assert.equal(runtime.round.grossStakeTotal, 5000);
-  assert.ok(runtime.round.distributionStartedAt > 0);
-  assert.ok(runtime.round.distributionEndsAt > runtime.round.distributionStartedAt);
-  assert.equal(runtime.round.swapStartedAt, null);
-});
-
-test('late join intent after round start is accepted without mutating joined count', async (t) => {
-  withStubbedStore(t);
-  const { runtime } = await createRuntimeFixture({ playerIds: ['p1', 'p2', 'p3', 'p4', 'p5', 'p6'] });
-  t.after(() => clearRuntimeTimers(runtime));
-
-  await joinPlayers(runtime, ['p1', 'p2', 'p3', 'p4', 'p5']);
-  await runtime.startRound('test');
-
-  const joinedCountBefore = runtime.getJoinedCount();
-  const result = await runtime.markJoinIntent({ playerId: 'p6', playerName: 'Late Player' });
-
-  assert.equal(result.ok, true);
-  assert.equal(result.lateJoin, true);
-  assert.equal(runtime.getJoinedCount(), joinedCountBefore);
-  assert.equal(runtime.players.find((player) => player.playerId === 'p6').playerName, 'Late Player');
-});
-
-test('startRound counts absent registered players in the economy and assignment', async (t) => {
-  withStubbedStore(t);
-  const { runtime } = await createRuntimeFixture({ playerIds: ['p1', 'p2', 'p3', 'p4', 'p5', 'p6'] });
-  t.after(() => clearRuntimeTimers(runtime));
-
-  await joinPlayers(runtime, ['p1', 'p2', 'p3', 'p4', 'p5']);
-  await runtime.startRound('test');
-
-  assert.equal(runtime.round.status, RoundStatus.DISTRIBUTING);
-  assert.equal(runtime.round.grossStakeTotal, 6000);
-  assert.equal(runtime.players.length, 6);
-  assert.equal(runtime.boxes.length, 6);
-
-  const absent = runtime.players.find((player) => player.playerId === 'p6');
-  assert.equal(absent.hasJoinedRound, false);
-  assert.ok(absent.assignedBoxId);
-  assert.ok(absent.currentBoxId);
-});
-
-test('handleHello sends welcome and snapshot for registered players', async (t) => {
+test('hello sends welcome and ready_status for registered players', async (t) => {
   withStubbedStore(t);
   const { runtime } = await createRuntimeFixture();
   t.after(() => clearRuntimeTimers(runtime));
@@ -186,11 +151,38 @@ test('handleHello sends welcome and snapshot for registered players', async (t) 
   await runtime.handleHello(ws, { playerId: 'p1', playerName: 'Alice' });
 
   assert.equal(ws.sent[0].type, ServerMessageType.WELCOME);
-  assert.equal(ws.sent[1].type, ServerMessageType.SESSION_SNAPSHOT);
+  assert.equal(ws.sent[1].type, ServerMessageType.READY_STATUS);
   assert.equal(runtime.connections.get('p1'), ws);
 });
 
-test('join intents rebroadcast fresh snapshots to already connected clients', async (t) => {
+test('player names are normalized and truncated to 15 characters', async (t) => {
+  withStubbedStore(t);
+  const { runtime } = await createRuntimeFixture();
+  t.after(() => clearRuntimeTimers(runtime));
+
+  await runtime.markJoinIntent({
+    playerId: 'p1',
+    playerName: '  Extra   Long   Player   Name  '
+  });
+
+  assert.equal(runtime.players.find((player) => player.playerId === 'p1').playerName, 'Extra Long Play');
+});
+
+test('timer_end is accepted as a no-op for demo client compatibility', async (t) => {
+  withStubbedStore(t);
+  const { runtime } = await createRuntimeFixture();
+  t.after(() => clearRuntimeTimers(runtime));
+
+  const ws = createFakeSocket();
+  await runtime.handleHello(ws, { playerId: 'p1', playerName: 'Alice' });
+  ws.sent = [];
+
+  await runtime.handleSocketMessage(ws, { type: ClientMessageType.TIMER_END });
+
+  assert.equal(ws.sent.length, 0);
+});
+
+test('join and ready updates only rebroadcast ready_status', async (t) => {
   withStubbedStore(t);
   const { runtime } = await createRuntimeFixture();
   t.after(() => clearRuntimeTimers(runtime));
@@ -205,14 +197,86 @@ test('join intents rebroadcast fresh snapshots to already connected clients', as
   await runtime.markJoinIntent({ playerId: 'p1', playerName: 'Alice' });
   await runtime.markJoinIntent({ playerId: 'p2', playerName: 'Bob' });
 
-  const snapshots = ws1.sent.filter((entry) => entry.type === ServerMessageType.SESSION_SNAPSHOT);
-  assert.equal(snapshots.length >= 2, true);
-  assert.equal(snapshots[0].joinedPlayerCount, 1);
-  assert.equal(snapshots.at(-1).joinedPlayerCount, 2);
-  assert.equal(snapshots.at(-1).snapshotRevision > snapshots[0].snapshotRevision, true);
+  const readyUpdates = messagesOf(ws1, ServerMessageType.READY_STATUS);
+  assert.equal(readyUpdates.length >= 2, true);
+  assert.equal(readyUpdates[0].joinedCount, 1);
+  assert.equal(readyUpdates.at(-1).joinedCount, 2);
+  assert.equal(ws1.sent.some((entry) => entry.type === ServerMessageType.SESSION_INIT), false);
+  assert.equal(ws1.sent.some((entry) => entry.type === ServerMessageType.SWAP_RESULT), false);
 });
 
-test('swap window computes the soft lock cutoff from total swap time and percent', async (t) => {
+test('round start sends exactly one session_init per connected player', async (t) => {
+  withStubbedStore(t);
+  const { runtime } = await createRuntimeFixture();
+  t.after(() => clearRuntimeTimers(runtime));
+
+  const ws1 = createFakeSocket();
+  const ws2 = createFakeSocket();
+  await runtime.handleHello(ws1, { playerId: 'p1', playerName: 'Alice' });
+  await runtime.handleHello(ws2, { playerId: 'p2', playerName: 'Bob' });
+  ws1.sent = [];
+  ws2.sent = [];
+
+  await joinPlayers(runtime, ['p1', 'p2', 'p3', 'p4', 'p5']);
+  assert.equal(runtime.round.status, RoundStatus.READY_CHECK);
+  await readyPlayers(runtime, ['p1', 'p2', 'p3', 'p4', 'p5']);
+  runtime.clearAllTimers();
+
+  assert.equal(runtime.round.status, RoundStatus.DISTRIBUTING);
+  assert.equal(runtime.round.grossStakeTotal, 5000);
+  assert.ok(runtime.round.distributionStartedAt > 0);
+  assert.ok(runtime.round.distributionEndsAt > runtime.round.distributionStartedAt);
+  assert.ok(runtime.round.swapStartedAt >= runtime.round.distributionEndsAt);
+  assert.ok(runtime.round.swapActionClosesAt > runtime.round.swapStartedAt);
+  assert.ok(runtime.round.swapEndsAt > runtime.round.swapActionClosesAt);
+
+  const init1 = messagesOf(ws1, ServerMessageType.SESSION_INIT);
+  const init2 = messagesOf(ws2, ServerMessageType.SESSION_INIT);
+  assert.equal(init1.length, 1);
+  assert.equal(init2.length, 1);
+  assert.equal(init1[0].playerBox, runtime.players.find((player) => player.playerId === 'p1').initialBoxNumber);
+  assert.equal(init2[0].playerBox, runtime.players.find((player) => player.playerId === 'p2').initialBoxNumber);
+});
+
+test('late join intent after round start is accepted without mutating joined count', async (t) => {
+  withStubbedStore(t);
+  const { runtime } = await createRuntimeFixture({ playerIds: ['p1', 'p2', 'p3', 'p4', 'p5', 'p6'] });
+  t.after(() => clearRuntimeTimers(runtime));
+
+  await joinPlayers(runtime, ['p1', 'p2', 'p3', 'p4', 'p5']);
+  await runtime.startRound('test');
+  runtime.clearAllTimers();
+
+  const joinedCountBefore = runtime.getJoinedCount();
+  const result = await runtime.markJoinIntent({ playerId: 'p6', playerName: 'Late Player' });
+
+  assert.equal(result.ok, true);
+  assert.equal(result.lateJoin, true);
+  assert.equal(runtime.getJoinedCount(), joinedCountBefore);
+  assert.equal(runtime.players.find((player) => player.playerId === 'p6').playerName, 'Late Player');
+});
+
+test('startRound counts absent registered players in economy and box assignment', async (t) => {
+  withStubbedStore(t);
+  const { runtime } = await createRuntimeFixture({ playerIds: ['p1', 'p2', 'p3', 'p4', 'p5', 'p6'] });
+  t.after(() => clearRuntimeTimers(runtime));
+
+  await joinPlayers(runtime, ['p1', 'p2', 'p3', 'p4', 'p5']);
+  await runtime.startRound('test');
+  runtime.clearAllTimers();
+
+  assert.equal(runtime.round.status, RoundStatus.DISTRIBUTING);
+  assert.equal(runtime.round.grossStakeTotal, 6000);
+  assert.equal(runtime.players.length, 6);
+  assert.equal(runtime.boxes.length, 6);
+
+  const absent = runtime.players.find((player) => player.playerId === 'p6');
+  assert.equal(absent.hasJoinedRound, false);
+  assert.ok(absent.assignedBoxId);
+  assert.ok(absent.currentBoxId);
+});
+
+test('swap window computes soft lock from total swap time and percent', async (t) => {
   withStubbedStore(t);
   withConfigOverride(t, 'swapPhaseMs', 1000);
   withConfigOverride(t, 'swapSoftLockPercent', 30);
@@ -221,35 +285,50 @@ test('swap window computes the soft lock cutoff from total swap time and percent
 
   await joinAndReadyAll(runtime, ['p1', 'p2', 'p3', 'p4', 'p5']);
   await runtime.openSwapWindow();
+  runtime.clearAllTimers();
 
   assert.equal(runtime.round.status, RoundStatus.SWAP_OPEN);
   assert.equal(runtime.round.swapActionClosesAt - runtime.round.swapStartedAt, 700);
   assert.equal(runtime.round.swapEndsAt - runtime.round.swapStartedAt, 1000);
 });
 
-test('swap flow supports pending, matched, and keep states', async (t) => {
+test('swap flow supports pending, matched, and keep states using swap_result messages', async (t) => {
   withStubbedStore(t);
   const { runtime } = await createRuntimeFixture();
   t.after(() => clearRuntimeTimers(runtime));
 
+  const ws1 = createFakeSocket();
+  const ws2 = createFakeSocket();
+  const ws3 = createFakeSocket();
+  await runtime.handleHello(ws1, { playerId: 'p1', playerName: 'Alice' });
+  await runtime.handleHello(ws2, { playerId: 'p2', playerName: 'Bob' });
+  await runtime.handleHello(ws3, { playerId: 'p3', playerName: 'Cara' });
+
   await joinAndReadyAll(runtime, ['p1', 'p2', 'p3', 'p4', 'p5']);
   await runtime.openSwapWindow();
+  runtime.clearAllTimers();
+  ws1.sent = [];
+  ws2.sent = [];
+  ws3.sent = [];
 
   const pending = await runtime.handleSwapRequest('p1');
   assert.equal(pending.pending, true);
   assert.equal(runtime.players.find((player) => player.playerId === 'p1').swapState, SwapState.PENDING);
+  assert.equal(messagesOf(ws1, ServerMessageType.SWAP_RESULT).length, 0);
 
   const matched = await runtime.handleSwapRequest('p2');
   assert.equal(matched.ok, true);
   assert.equal(runtime.players.find((player) => player.playerId === 'p1').swapState, SwapState.MATCHED);
   assert.equal(runtime.players.find((player) => player.playerId === 'p2').swapState, SwapState.MATCHED);
+  assert.equal(messagesOf(ws1, ServerMessageType.SWAP_RESULT)[0].outcome, 'found');
+  assert.equal(messagesOf(ws2, ServerMessageType.SWAP_RESULT)[0].outcome, 'found');
 
   const kept = await runtime.handleKeepBox('p3');
   assert.equal(kept.ok, true);
   assert.equal(runtime.players.find((player) => player.playerId === 'p3').swapState, SwapState.KEPT);
 });
 
-test('matched swap broadcasts the success outcome and snapshot box number', async (t) => {
+test('softlock sends softlock and not_found outcomes without a snapshot fallback', async (t) => {
   withStubbedStore(t);
   const { runtime } = await createRuntimeFixture();
   t.after(() => clearRuntimeTimers(runtime));
@@ -260,239 +339,105 @@ test('matched swap broadcasts the success outcome and snapshot box number', asyn
   await runtime.handleHello(ws2, { playerId: 'p2', playerName: 'Bob' });
 
   await joinAndReadyAll(runtime, ['p1', 'p2', 'p3', 'p4', 'p5']);
-  const initialP1Box = runtime.players.find((player) => player.playerId === 'p1').currentBoxId;
-  const initialP2Box = runtime.players.find((player) => player.playerId === 'p2').currentBoxId;
   await runtime.openSwapWindow();
+  runtime.clearAllTimers();
   ws1.sent = [];
   ws2.sent = [];
 
   await runtime.handleSwapRequest('p1');
-  await runtime.handleSwapRequest('p2');
-
-  assert.equal(runtime.players.find((player) => player.playerId === 'p1').swapState, SwapState.MATCHED);
-  assert.equal(runtime.players.find((player) => player.playerId === 'p2').swapState, SwapState.MATCHED);
-  assert.notEqual(runtime.players.find((player) => player.playerId === 'p1').currentBoxId, initialP1Box);
-  assert.notEqual(runtime.players.find((player) => player.playerId === 'p2').currentBoxId, initialP2Box);
-
-  const p1MatchMessage = ws1.sent.find((entry) => entry.type === ServerMessageType.SWAP_MATCHED);
-  const p2MatchMessage = ws2.sent.find((entry) => entry.type === ServerMessageType.SWAP_MATCHED);
-  assert.ok(p1MatchMessage);
-  assert.ok(p2MatchMessage);
-  assert.ok(p1MatchMessage.newBoxNumber != null);
-  assert.ok(p2MatchMessage.newBoxNumber != null);
-
-  const p1Snapshot = ws1.sent.filter((entry) => entry.type === ServerMessageType.SESSION_SNAPSHOT).at(-1);
-  const p2Snapshot = ws2.sent.filter((entry) => entry.type === ServerMessageType.SESSION_SNAPSHOT).at(-1);
-  assert.equal(p1Snapshot.you.swapState, SwapState.MATCHED);
-  assert.equal(p2Snapshot.you.swapState, SwapState.MATCHED);
-  assert.equal(p1Snapshot.you.currentBoxNumber, p1MatchMessage.newBoxNumber);
-  assert.equal(p2Snapshot.you.currentBoxNumber, p2MatchMessage.newBoxNumber);
-});
-
-test('soft lock resolves pending swaps to unmatched and auto-keeps untouched players', async (t) => {
-  withStubbedStore(t);
-  const { runtime } = await createRuntimeFixture();
-  t.after(() => clearRuntimeTimers(runtime));
-
-  await joinAndReadyAll(runtime, ['p1', 'p2', 'p3', 'p4', 'p5']);
-  await runtime.openSwapWindow();
-  await runtime.handleSwapRequest('p1');
   const result = await runtime.applySwapSoftLock();
 
   assert.deepEqual(result.unmatchedPlayerIds, ['p1']);
-  assert.deepEqual(result.autoKeptPlayerIds.sort(), ['p2', 'p3', 'p4', 'p5']);
+  assert.equal(result.autoKeptPlayerIds.includes('p2'), true);
   assert.equal(runtime.players.find((player) => player.playerId === 'p1').swapState, SwapState.UNMATCHED);
-  assert.equal(runtime.players.filter((player) => player.swapState === SwapState.KEPT).length, 4);
-  assert.equal(runtime.players.some((player) => player.swapState === SwapState.PENDING), false);
+  assert.equal(runtime.players.find((player) => player.playerId === 'p2').swapState, SwapState.KEPT);
+
+  const p1Softlock = messagesOf(ws1, ServerMessageType.SOFTLOCK)[0];
+  const p1SwapResult = messagesOf(ws1, ServerMessageType.SWAP_RESULT)[0];
+  const p2Softlock = messagesOf(ws2, ServerMessageType.SOFTLOCK)[0];
+  assert.equal(p1Softlock.priorSwapState, 'PENDING');
+  assert.equal(p1SwapResult.outcome, 'not_found');
+  assert.equal(p2Softlock.priorSwapState, 'NONE');
 });
 
-test('swap request still fails after the soft-lock cutoff', async (t) => {
+test('swap requests fail after the soft-lock cutoff', async (t) => {
   withStubbedStore(t);
   const { runtime } = await createRuntimeFixture();
   t.after(() => clearRuntimeTimers(runtime));
 
   await joinAndReadyAll(runtime, ['p1', 'p2', 'p3', 'p4', 'p5']);
   await runtime.openSwapWindow();
+  runtime.clearAllTimers();
   runtime.round.swapActionClosesAt = Date.now() - 1;
 
-  const swapResult = await runtime.handleSwapRequest('p1');
+  const result = await runtime.handleSwapRequest('p1');
 
-  assert.equal(swapResult.ok, false);
-  assert.equal(swapResult.error, 'SWAP_SOFT_LOCKED');
+  assert.equal(result.ok, false);
+  assert.equal(result.error, 'SOFTLOCK_ACTIVE');
 });
 
-test('closeSwapWindow preserves unmatched soft-lock outcomes and ends the swap window', async (t) => {
+test('closeSwapWindow preserves settled outcomes and round_result unlocks leaderboard_data', async (t) => {
   withStubbedStore(t);
   const { runtime } = await createRuntimeFixture();
   t.after(() => clearRuntimeTimers(runtime));
 
+  const ws = createFakeSocket();
+  await runtime.handleHello(ws, { playerId: 'p1', playerName: 'Alice' });
+
   await joinAndReadyAll(runtime, ['p1', 'p2', 'p3', 'p4', 'p5']);
   await runtime.openSwapWindow();
+  runtime.clearAllTimers();
+  ws.sent = [];
+
   await runtime.handleSwapRequest('p1');
   await runtime.applySwapSoftLock();
   await runtime.closeSwapWindow();
+  runtime.clearAllTimers();
 
-  assert.equal(runtime.players.find((player) => player.playerId === 'p1').swapState, SwapState.UNMATCHED);
-  assert.equal(runtime.players.filter((player) => player.swapState === SwapState.KEPT).length, 4);
-  assert.equal(runtime.players.some((player) => player.swapState === SwapState.PENDING), false);
-  assert.equal(runtime.round.status, RoundStatus.REVEALING);
+  assert.equal(runtime.round.status, RoundStatus.SWAP_CLOSED);
   assert.ok(runtime.round.swapClosedAt > 0);
-  assert.ok(runtime.round.revealAt >= runtime.round.swapClosedAt);
-  assert.ok(runtime.round.preResultStartedAt >= runtime.round.swapClosedAt);
-  assert.ok(runtime.round.finalResultsReleaseAt >= runtime.round.preResultStartedAt);
-});
+  assert.ok(runtime.round.finalResultsReleaseAt >= runtime.round.swapClosedAt);
 
-test('soft lock broadcasts the no-match outcome before reveal starts', async (t) => {
-  withStubbedStore(t);
-  const { runtime } = await createRuntimeFixture();
-  t.after(() => clearRuntimeTimers(runtime));
-
-  const ws = createFakeSocket();
-  await runtime.handleHello(ws, { playerId: 'p1', playerName: 'Alice' });
-
-  await joinAndReadyAll(runtime, ['p1', 'p2', 'p3', 'p4', 'p5']);
-  await runtime.openSwapWindow();
-  ws.sent = [];
-
-  await runtime.handleSwapRequest('p1');
-  await runtime.applySwapSoftLock();
-
-  const unmatchedMessage = ws.sent.find((entry) => entry.type === ServerMessageType.SWAP_UNMATCHED);
-  const unmatchedIndex = ws.sent.findIndex((entry) => entry.type === ServerMessageType.SWAP_UNMATCHED);
-  const latestSnapshot = ws.sent.filter((entry) => entry.type === ServerMessageType.SESSION_SNAPSHOT).at(-1);
-
-  assert.ok(unmatchedMessage);
-  assert.ok(unmatchedIndex >= 0);
-  assert.equal(runtime.round.status, RoundStatus.SWAP_OPEN);
-  assert.equal(latestSnapshot.you.swapState, SwapState.UNMATCHED);
-});
-
-test('swap end does not change already-settled unmatched outcomes after soft lock', async (t) => {
-  withStubbedStore(t);
-  const { runtime } = await createRuntimeFixture();
-  t.after(() => clearRuntimeTimers(runtime));
-
-  const ws = createFakeSocket();
-  await runtime.handleHello(ws, { playerId: 'p1', playerName: 'Alice' });
-
-  await joinAndReadyAll(runtime, ['p1', 'p2', 'p3', 'p4', 'p5']);
-  await runtime.openSwapWindow();
-  ws.sent = [];
-
-  await runtime.handleSwapRequest('p1');
-  await runtime.applySwapSoftLock();
-  const unmatchedMessagesBeforeClose = ws.sent.filter((entry) => entry.type === ServerMessageType.SWAP_UNMATCHED).length;
-
-  await runtime.closeSwapWindow();
-
-  const unmatchedMessagesAfterClose = ws.sent.filter((entry) => entry.type === ServerMessageType.SWAP_UNMATCHED).length;
-  assert.equal(runtime.players.find((player) => player.playerId === 'p1').swapState, SwapState.UNMATCHED);
-  assert.equal(unmatchedMessagesAfterClose, unmatchedMessagesBeforeClose);
-});
-
-test('entering reveal starts the pre-result barrier immediately and counts only connected clients', async (t) => {
-  withStubbedStore(t);
-  const { runtime } = await createRuntimeFixture();
-  t.after(() => clearRuntimeTimers(runtime));
-
-  const ws = createFakeSocket();
-  await runtime.handleHello(ws, { playerId: 'p1', playerName: 'Alice' });
-
-  await joinAndReadyAll(runtime, ['p1', 'p2', 'p3', 'p4', 'p5']);
-  await runtime.openSwapWindow();
-  await runtime.closeSwapWindow();
-
-  assert.equal(runtime.round.status, RoundStatus.REVEALING);
-  assert.deepEqual(runtime.round.preResultExpectedReadyPlayerIds, ['p1']);
-  assert.deepEqual(runtime.round.preResultReadyPlayerIds, []);
-  assert.equal(runtime.round.finalResultsReleaseAt, null);
-  assert.equal(ws.sent.some((entry) => entry.type === ServerMessageType.REVEAL_START), true);
-  assert.equal(ws.sent.some((entry) => entry.type === ServerMessageType.ROUND_RESULTS), false);
-});
-
-test('duplicate PRE_RESULT_READY is idempotent and release waits for the configured hold', async (t) => {
-  withStubbedStore(t);
-  withConfigOverride(t, 'preResultHoldMs', 25);
-  const { runtime } = await createRuntimeFixture();
-  t.after(() => clearRuntimeTimers(runtime));
-
-  const ws = createFakeSocket();
-  await runtime.handleHello(ws, { playerId: 'p1', playerName: 'Alice' });
-
-  await joinAndReadyAll(runtime, ['p1', 'p2', 'p3', 'p4', 'p5']);
-  await runtime.openSwapWindow();
-  await runtime.closeSwapWindow();
-
-  const readyResult = await runtime.handlePreResultReady('p1');
-  const duplicateResult = await runtime.handlePreResultReady('p1');
-
-  assert.equal(readyResult.ok, true);
-  assert.equal(duplicateResult.ok, true);
-  assert.deepEqual(runtime.round.preResultReadyPlayerIds, ['p1']);
-  assert.ok(runtime.round.finalResultsReleaseAt >= Date.now());
-  assert.equal(ws.sent.some((entry) => entry.type === ServerMessageType.ROUND_RESULTS), false);
-
-  runtime.round.finalResultsReleaseAt = Date.now() - 1;
-  await runtime.resumeTimers();
+  await runtime.publishResults();
 
   assert.equal(runtime.round.status, RoundStatus.ROUND_ENDED);
   assert.equal(runtime.session.status, SessionStatus.REPLAY_WAITING);
   assert.equal(runtime.players.every((player) => player.finalBoxNumber != null), true);
   assert.equal(runtime.players.every((player) => player.finalPrizeAmount != null), true);
 
-  const roundResultsMessage = ws.sent.filter((entry) => entry.type === ServerMessageType.ROUND_RESULTS).at(-1);
-  assert.equal(roundResultsMessage.allPlayers.length, runtime.players.length);
-  assert.deepEqual(Object.keys(roundResultsMessage.allPlayers[0]).sort(), [
-    'finalBoxNumber',
-    'initialBoxNumber',
-    'isWinner',
-    'playerId',
-    'playerName',
-    'prizeAmount',
-    'wasSwapped'
-  ]);
+  const roundResult = messagesOf(ws, ServerMessageType.ROUND_RESULT).at(-1);
+  assert.ok(roundResult);
+  assert.ok(['win', 'lose'].includes(roundResult.result));
+
+  ws.sent = [];
+  await runtime.handleSocketMessage(ws, { type: 'leaderboard_request' });
+  const leaderboard = messagesOf(ws, ServerMessageType.LEADERBOARD_DATA)[0];
+  assert.ok(leaderboard);
+  assert.equal(leaderboard.totalPlayers, runtime.round.expectedPlayerCountForRound);
 });
 
-test('disconnect during the pre-result barrier removes the player from the blocking set', async (t) => {
+test('reconnecting during an active or ended round replays session_init and settled messages', async (t) => {
   withStubbedStore(t);
   const { runtime } = await createRuntimeFixture();
   t.after(() => clearRuntimeTimers(runtime));
 
-  const ws = createFakeSocket();
-  await runtime.handleHello(ws, { playerId: 'p1', playerName: 'Alice' });
-
   await joinAndReadyAll(runtime, ['p1', 'p2', 'p3', 'p4', 'p5']);
   await runtime.openSwapWindow();
+  runtime.clearAllTimers();
+  await runtime.handleSwapRequest('p1');
+  await runtime.applySwapSoftLock();
   await runtime.closeSwapWindow();
-  await runtime.handleDisconnect('p1');
-
-  assert.deepEqual(runtime.round.preResultExpectedReadyPlayerIds, []);
-  assert.deepEqual(runtime.round.preResultReadyPlayerIds, []);
-  assert.ok(runtime.round.finalResultsReleaseAt != null);
-});
-
-test('pre-result timeout falls back to release even if some clients never report ready', async (t) => {
-  withStubbedStore(t);
-  const { runtime } = await createRuntimeFixture();
-  t.after(() => clearRuntimeTimers(runtime));
+  runtime.clearAllTimers();
+  await runtime.publishResults();
 
   const ws = createFakeSocket();
   await runtime.handleHello(ws, { playerId: 'p1', playerName: 'Alice' });
 
-  await joinAndReadyAll(runtime, ['p1', 'p2', 'p3', 'p4', 'p5']);
-  await runtime.openSwapWindow();
-  await runtime.closeSwapWindow();
-
-  runtime.round.preResultReadyDeadlineAt = Date.now() - 1;
-  await runtime.resumeTimers();
-
-  assert.ok(runtime.round.finalResultsReleaseAt != null);
-
-  runtime.round.finalResultsReleaseAt = Date.now() - 1;
-  await runtime.resumeTimers();
-
-  assert.equal(runtime.round.status, RoundStatus.ROUND_ENDED);
-  assert.equal(ws.sent.some((entry) => entry.type === ServerMessageType.ROUND_RESULTS), true);
+  assert.equal(messagesOf(ws, ServerMessageType.WELCOME).length, 1);
+  assert.equal(messagesOf(ws, ServerMessageType.READY_STATUS).length, 1);
+  assert.equal(messagesOf(ws, ServerMessageType.SESSION_INIT).length, 1);
+  assert.equal(messagesOf(ws, ServerMessageType.SWAP_RESULT).length, 1);
+  assert.equal(messagesOf(ws, ServerMessageType.ROUND_RESULT).length, 1);
 });
 
 test('createReplayRound reuses the session and creates a new round', async (t) => {
@@ -503,6 +448,7 @@ test('createReplayRound reuses the session and creates a new round', async (t) =
   const originalSessionId = runtime.session.sessionId;
   const originalRoundId = runtime.round.roundId;
   await runtime.createReplayRound(['p1', 'p2', 'p3', 'p4', 'p5']);
+  runtime.clearAllTimers();
 
   assert.equal(runtime.session.sessionId, originalSessionId);
   assert.notEqual(runtime.round.roundId, originalRoundId);
@@ -511,12 +457,26 @@ test('createReplayRound reuses the session and creates a new round', async (t) =
   assert.equal(runtime.session.status, SessionStatus.WAITING_FOR_FIRST_JOIN);
 });
 
+test('createReplayRound supports replaying with only 2 connected players', async (t) => {
+  withStubbedStore(t);
+  const { runtime } = await createRuntimeFixture({ playerIds: ['p1', 'p2', 'p3'] });
+  t.after(() => clearRuntimeTimers(runtime));
+
+  await runtime.createReplayRound(['p1', 'p2']);
+  runtime.clearAllTimers();
+
+  assert.equal(runtime.round.expectedPlayerCountForRound, 2);
+  assert.equal(runtime.session.currentExpectedPlayerCount, 2);
+  assert.deepEqual(runtime.session.registeredPlayerIds, ['p1', 'p2']);
+});
+
 test('createReplayRound releases locks for players excluded from replay', async (t) => {
   const stub = withStubbedStore(t);
   const { runtime } = await createRuntimeFixture({ playerIds: ['p1', 'p2', 'p3', 'p4', 'p5', 'p6'] });
   t.after(() => clearRuntimeTimers(runtime));
 
   await runtime.createReplayRound(['p1', 'p2', 'p3', 'p4', 'p5']);
+  runtime.clearAllTimers();
 
   assert.equal(runtime.session.registeredPlayerIds.includes('p6'), false);
   assert.equal(

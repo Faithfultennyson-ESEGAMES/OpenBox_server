@@ -1,7 +1,4 @@
 import express from 'express';
-import fs from 'node:fs/promises';
-import path from 'node:path';
-import { fileURLToPath } from 'node:url';
 import config from '../config.js';
 import { requireControlAuth } from './middleware/auth.js';
 import sessionRegistry from '../runtime/sessionRegistry.js';
@@ -19,34 +16,36 @@ import { signJsonPayload } from '../security/hmac.js';
 import { buildSessionCreatedPayload } from '../webhooks/payloads.js';
 
 const router = express.Router();
-const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const clientRoot = path.resolve(__dirname, '../../../client/public');
-const clientIndexPath = path.join(clientRoot, 'index.html');
 
 const asyncRoute = (handler) => (req, res, next) => {
   Promise.resolve(handler(req, res, next)).catch(next);
 };
 
-function setNoStoreHeaders(res) {
-  res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
-  res.setHeader('Pragma', 'no-cache');
-  res.setHeader('Expires', '0');
-  res.setHeader('Surrogate-Control', 'no-store');
-}
-
-async function sendClientIndex(req, res) {
-  const clientBuildVersion = String(req.query?.v || Date.now().toString(36));
-  const html = await fs.readFile(clientIndexPath, 'utf8');
-  const rendered = html
-    .replace('/src/style.css', `/src/style.css?v=${clientBuildVersion}`)
-    .replace('/src/main.js', `/src/main.js?v=${clientBuildVersion}`);
-
-  setNoStoreHeaders(res);
-  res.type('html').send(rendered);
+function normalizePlayerName(value) {
+  return String(value || '').trim().replace(/\s+/g, ' ').slice(0, 15);
 }
 
 function buildServerJoinUrl(req, sessionId) {
   return `${req.protocol}://${req.get('host')}/session/${sessionId}/join`;
+}
+
+function buildWsUrl(req) {
+  const protocol = req.protocol === 'https' ? 'wss' : 'ws';
+  return `${protocol}://${req.get('host')}`;
+}
+
+function buildClientLaunchUrl(req, sessionId, query = {}) {
+  const url = new URL(config.clientBaseUrl);
+  url.searchParams.set('joinUrl', buildServerJoinUrl(req, sessionId));
+  url.searchParams.set('sessionId', sessionId);
+  url.searchParams.set('ws', buildWsUrl(req));
+
+  for (const [key, value] of Object.entries(query)) {
+    if (value == null || value === '') continue;
+    url.searchParams.set(key, String(value));
+  }
+
+  return url.toString();
 }
 
 function isUuid(value) {
@@ -148,7 +147,8 @@ router.post('/session/start', requireControlAuth, asyncRoute(async (req, res) =>
 router.post('/session/:sessionId/join-intent', asyncRoute(async (req, res) => {
   const { sessionId } = req.params;
   const { playerId, playerName } = req.body || {};
-  if (!playerId || !playerName) {
+  const normalizedPlayerName = normalizePlayerName(playerName);
+  if (!playerId || !normalizedPlayerName) {
     res.status(400).json({ error: 'playerId and playerName are required' });
     return;
   }
@@ -161,7 +161,7 @@ router.post('/session/:sessionId/join-intent', asyncRoute(async (req, res) => {
 
   const result = await runtime.markJoinIntent({
     playerId: String(playerId),
-    playerName: String(playerName).trim()
+    playerName: normalizedPlayerName
   });
   if (!result.ok) {
     res.status(400).json({ error: result.error });
@@ -174,8 +174,8 @@ router.post('/session/:sessionId/join-intent', asyncRoute(async (req, res) => {
 router.post('/session/:sessionId/replay', requireControlAuth, asyncRoute(async (req, res) => {
   const { sessionId } = req.params;
   const playerIds = Array.isArray(req.body?.playerIds) ? req.body.playerIds.map(String) : [];
-  if (playerIds.length < 5) {
-    res.status(400).json({ error: 'Replay requires at least 5 unique players' });
+  if (playerIds.length < 2) {
+    res.status(400).json({ error: 'Replay requires at least 2 unique players' });
     return;
   }
   if (new Set(playerIds).size !== playerIds.length) {
@@ -364,15 +364,115 @@ router.get('/session/:sessionId', asyncRoute(async (req, res) => {
   res.json(buildPublicSessionState(runtime));
 }));
 
-router.get('/session/:sessionId/join', (req, res) => {
-  sendClientIndex(req, res).catch((error) => {
-    res.status(500).json({ error: error.message || 'Unable to load client' });
-  });
-});
+router.get('/session/:sessionId/join', asyncRoute(async (req, res) => {
+  const runtime = await sessionRegistry.getOrHydrate(req.params.sessionId);
+  if (!runtime) {
+    res.status(404).send('Session not found.');
+    return;
+  }
+
+  const playerId = String(req.query.playerId || req.query.playerID || '').trim();
+  const playerName = normalizePlayerName(req.query.playerName);
+  res.redirect(302, buildClientLaunchUrl(req, req.params.sessionId, { playerId, playerName }));
+}));
 
 router.get('/health', asyncRoute(async (req, res) => {
   const activeSessions = await redisStore.getActiveSessionIds();
   res.json({ ok: true, activeSessions: activeSessions.length });
+}));
+
+router.get('/api/health', asyncRoute(async (req, res) => {
+  const activeSessions = await redisStore.getActiveSessionIds();
+  res.json({ ok: true, activeSessions: activeSessions.length });
+}));
+
+router.post('/api/sessions', asyncRoute(async (req, res) => {
+  const playerCount = Number.parseInt(req.body?.playerCount, 10);
+  const stakeAmount = Number.parseFloat(req.body?.stakeAmount);
+  if (!Number.isFinite(playerCount) || playerCount < 2 || playerCount > 50) {
+    res.status(400).json({ error: 'playerCount must be between 2 and 50' });
+    return;
+  }
+  if (!Number.isFinite(stakeAmount) || stakeAmount <= 0) {
+    res.status(400).json({ error: 'stakeAmount must be a positive number' });
+    return;
+  }
+
+  const requestedPlayerIds = Array.isArray(req.body?.playerIds) ? req.body.playerIds.map(String) : [];
+  const playerIds = requestedPlayerIds.length
+    ? requestedPlayerIds
+    : Array.from({ length: playerCount }, (_, index) => `player-${index + 1}`);
+
+  const validation = validateStartPayload({
+    playerCount,
+    stakeAmount,
+    playerIds
+  });
+  if (!validation.ok) {
+    res.status(400).json({ error: validation.error });
+    return;
+  }
+
+  let runtime;
+  try {
+    runtime = await sessionRegistry.createSession({
+      ...validation,
+      platformFeeType: config.platformFeeType,
+      platformFeeValue: config.platformFeeValue
+    });
+  } catch (error) {
+    if (error?.code === 'PLAYER_ACTIVE_SESSION_CONFLICT') {
+      res.status(409).json({
+        error: error.message,
+        code: error.code,
+        playerId: error.playerId,
+        activeSessionId: error.activeSessionId
+      });
+      return;
+    }
+    throw error;
+  }
+
+  await dispatchWebhook(
+    WebhookEventType.SESSION_CREATED,
+    buildSessionCreatedPayload({
+      eventName: WebhookEventType.SESSION_CREATED,
+      session: runtime.session,
+      round: runtime.round,
+      players: runtime.players
+    })
+  );
+
+  const joinUrl = buildServerJoinUrl(req, runtime.session.sessionId);
+  res.status(201).json({
+    sessionId: runtime.session.sessionId,
+    joinUrl,
+    clientUrl: buildClientLaunchUrl(req, runtime.session.sessionId),
+    wsUrl: buildWsUrl(req),
+    playerCount: runtime.session.initialExpectedPlayerCount,
+    readyTimeoutMs: config.readyCheckTimeoutMs,
+    softLockPercent: config.swapSoftLockPercent,
+    playerIds
+  });
+}));
+
+router.get('/api/sessions/:sessionId', asyncRoute(async (req, res) => {
+  const runtime = await sessionRegistry.getOrHydrate(req.params.sessionId);
+  if (!runtime) {
+    res.status(404).json({ error: 'Session not found' });
+    return;
+  }
+  res.json(buildPublicSessionState(runtime));
+}));
+
+router.post('/api/sessions/:sessionId/end', asyncRoute(async (req, res) => {
+  const runtime = await sessionRegistry.getOrHydrate(req.params.sessionId);
+  if (!runtime) {
+    res.status(404).json({ error: 'Session not found' });
+    return;
+  }
+  await runtime.endSession('manual_end');
+  res.json({ ok: true, sessionId: runtime.session.sessionId });
 }));
 
 export default router;

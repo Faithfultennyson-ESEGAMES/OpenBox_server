@@ -7,15 +7,11 @@ import {
   SwapState,
   WebhookEventType
 } from '../shared/protocol.js';
-import { CONTAINER_SIZE, getDistributionDurationMs, getSwapActionCloseOffsetMs } from '../shared/twod.js';
 import config from '../config.js';
 import redisStore from '../store/redisStore.js';
 import { buildBoxes } from '../domain/prizes.js';
 import { closeSwaps, requestSwap } from '../domain/swaps.js';
-import { buildRoundResultsSnapshot, buildSessionSnapshot } from './snapshot.js';
 import { createRound, createRoundPlayers, findPlayer } from '../domain/sessionState.js';
-import { dispatchWebhook } from '../webhooks/dispatcher.js';
-import { notifyMatchmakingSessionClosed } from '../webhooks/matchmakingNotifier.js';
 import {
   MINIMUM_PLAYERS_TO_START,
   buildPlayerConnectionPayload,
@@ -29,7 +25,37 @@ import {
   buildSessionReplayStartedPayload,
   buildSessionReplayWaitingPayload
 } from '../webhooks/payloads.js';
+import { dispatchWebhook } from '../webhooks/dispatcher.js';
+import { notifyMatchmakingSessionClosed } from '../webhooks/matchmakingNotifier.js';
 import { send, sendError } from '../ws/wsProtocol.js';
+
+const CONTAINER_SIZE = 12;
+const MAX_PLAYER_NAME_LENGTH = 15;
+
+function normalizePlayerName(value) {
+  return String(value || '').trim().replace(/\s+/g, ' ').slice(0, MAX_PLAYER_NAME_LENGTH);
+}
+
+function buildInitials(name) {
+  const letters = normalizePlayerName(name)
+    .split(' ')
+    .filter(Boolean)
+    .slice(0, 2)
+    .map((part) => part[0]?.toUpperCase() || '')
+    .join('');
+  return letters || 'PL';
+}
+
+function formatCurrency(amount) {
+  const numeric = Number.isFinite(Number(amount)) ? Number(amount) : 0;
+  return `N${numeric.toLocaleString('en-US')}`;
+}
+
+function getSwapActionCloseOffsetMs({ swapPhaseMs, softLockPercent }) {
+  const safePhaseMs = Math.max(1, Number(swapPhaseMs || 0));
+  const safePercent = Math.min(100, Math.max(0, Number(softLockPercent || 0)));
+  return Math.max(0, safePhaseMs - Math.floor((safePhaseMs * safePercent) / 100));
+}
 
 export class SessionRuntime {
   constructor(session) {
@@ -45,8 +71,7 @@ export class SessionRuntime {
       distribution: null,
       swapSoftLock: null,
       swapClose: null,
-      preResultReadyTimeout: null,
-      finalResultsRelease: null,
+      resultsRelease: null,
       replayEnd: null
     };
   }
@@ -128,20 +153,10 @@ export class SessionRuntime {
     }
   }
 
-  async sendSnapshot(playerId) {
+  sendToPlayer(playerId, type, payload = {}) {
     const ws = this.connections.get(playerId);
-    if (!ws || !this.round) return;
-    send(
-      ws,
-      ServerMessageType.SESSION_SNAPSHOT,
-      buildSessionSnapshot({
-        session: this.session,
-        round: this.round,
-        players: this.players,
-        boxes: this.boxes,
-        playerId
-      })
-    );
+    if (!ws) return;
+    send(ws, type, payload);
   }
 
   bumpSnapshotRevision() {
@@ -153,25 +168,113 @@ export class SessionRuntime {
     await this.persist();
   }
 
-  async broadcastSnapshots(targetPlayerIds = null) {
-    if (!this.round) return;
-    const targetSet = targetPlayerIds
-      ? new Set(Array.isArray(targetPlayerIds) ? targetPlayerIds : [targetPlayerIds])
-      : null;
+  buildWelcome(player) {
+    return {
+      sessionId: this.session.sessionId,
+      playerId: player.playerId,
+      playerName: player.playerName || null,
+      sessionState: this.session.status,
+      expectedPlayerCount: this.round?.expectedPlayerCountForRound || this.session.currentExpectedPlayerCount,
+      readyTimeoutMs: config.readyCheckTimeoutMs
+    };
+  }
 
-    for (const [playerId, ws] of this.connections.entries()) {
-      if (targetSet && !targetSet.has(playerId)) continue;
-      send(
-        ws,
-        ServerMessageType.SESSION_SNAPSHOT,
-        buildSessionSnapshot({
-          session: this.session,
-          round: this.round,
-          players: this.players,
-          boxes: this.boxes,
-          playerId
-        })
-      );
+  buildReadyStatus() {
+    return {
+      joinedCount: this.getJoinedCount(),
+      readyCount: this.round?.readyPlayerIdsForRound?.length || 0,
+      expectedPlayerCount: this.round?.expectedPlayerCountForRound || this.session.currentExpectedPlayerCount,
+      readyEndsAt: this.round?.readyCheckDeadlineAt || null,
+      readyPlayerIds: [...(this.round?.readyPlayerIdsForRound || [])]
+    };
+  }
+
+  buildSessionInitFor(player) {
+    return {
+      sessionId: this.session.sessionId,
+      roundId: this.round.roundId,
+      playerBox: player.initialBoxNumber,
+      partnerBox: null,
+      totalPlayers: this.round.expectedPlayerCountForRound,
+      containerSize: CONTAINER_SIZE,
+      swapWindowSeconds: Math.max(1, Math.round(config.swapPhaseMs / 1000)),
+      softLockPercent: config.swapSoftLockPercent,
+      softLockAt: this.round.swapActionClosesAt,
+      swapEndsAt: this.round.swapEndsAt,
+      playerName: player.playerName || null,
+      playerInitials: buildInitials(player.playerName),
+      stakeAmount: formatCurrency(this.session.stakeAmount),
+      rewardPool: Number(this.round.rewardPool || 0)
+    };
+  }
+
+  buildLeaderboardData(requestingPlayerId) {
+    return {
+      players: this.players.map((player) => ({
+        name: player.playerName || player.playerId,
+        init: buildInitials(player.playerName || player.playerId),
+        origBox: player.initialBoxNumber,
+        curBox: player.finalBoxNumber ?? player.initialBoxNumber,
+        prize: Number(player.finalPrizeAmount || 0),
+        win: !!player.isWinner,
+        swapped: player.initialBoxId != null && player.finalBoxId != null && player.initialBoxId !== player.finalBoxId,
+        you: player.playerId === requestingPlayerId,
+        playerId: player.playerId
+      })),
+      rewardPool: Number(this.round.rewardPool || 0),
+      totalPlayers: this.round.expectedPlayerCountForRound
+    };
+  }
+
+  buildRoundResult(player) {
+    return {
+      result: player.isWinner ? 'win' : 'lose',
+      prize: Number(player.finalPrizeAmount || 0),
+      finalBox: player.finalBoxNumber,
+      didSwap: player.initialBoxId != null && player.finalBoxId != null && player.initialBoxId !== player.finalBoxId
+    };
+  }
+
+  emitReadyStatus(targetPlayerId = null) {
+    this.broadcast(ServerMessageType.READY_STATUS, this.buildReadyStatus(), targetPlayerId);
+  }
+
+  removePendingSwap(playerId) {
+    this.swaps.queue = this.swaps.queue.filter((entry) => entry.playerId !== playerId);
+  }
+
+  isSoftLockActive(now = Date.now()) {
+    return Number.isFinite(this.round?.swapActionClosesAt) && now >= Number(this.round.swapActionClosesAt);
+  }
+
+  sendRuntimeStateToPlayer(player) {
+    if (!player) return;
+
+    if ([RoundStatus.DISTRIBUTING, RoundStatus.SWAP_OPEN, RoundStatus.SWAP_CLOSED, RoundStatus.ROUND_ENDED].includes(this.round.status)) {
+      this.sendToPlayer(player.playerId, ServerMessageType.SESSION_INIT, this.buildSessionInitFor(player));
+    }
+
+    if (player.swapState === SwapState.MATCHED) {
+      this.sendToPlayer(player.playerId, ServerMessageType.SWAP_RESULT, {
+        outcome: 'found',
+        partnerBox: player.finalBoxNumber ?? this.getCurrentBoxNumber(player.playerId)
+      });
+    } else if (player.swapState === SwapState.UNMATCHED) {
+      this.sendToPlayer(player.playerId, ServerMessageType.SWAP_RESULT, { outcome: 'not_found' });
+    } else if (player.swapState === SwapState.KEPT && player.softLockSource && player.softLockSource !== 'MANUAL_KEEP') {
+      this.sendToPlayer(player.playerId, ServerMessageType.SOFTLOCK, {
+        finalBox: this.getCurrentBoxNumber(player.playerId),
+        priorSwapState: player.softLockSource
+      });
+    } else if (player.swapState === SwapState.PENDING && this.isSoftLockActive()) {
+      this.sendToPlayer(player.playerId, ServerMessageType.SOFTLOCK, {
+        finalBox: this.getCurrentBoxNumber(player.playerId),
+        priorSwapState: 'PENDING'
+      });
+    }
+
+    if (this.round.status === RoundStatus.ROUND_ENDED && player.finalBoxNumber != null) {
+      this.sendToPlayer(player.playerId, ServerMessageType.ROUND_RESULT, this.buildRoundResult(player));
     }
   }
 
@@ -182,21 +285,19 @@ export class SessionRuntime {
       return { ok: false, error: 'SESSION_ENDED' };
     }
 
+    player.playerName = normalizePlayerName(playerName) || player.playerName || playerId;
+    player.lastSeenAt = Date.now();
+
     const lateJoinPhase = [
       RoundStatus.DISTRIBUTING,
       RoundStatus.SWAP_OPEN,
       RoundStatus.SWAP_CLOSED,
-      RoundStatus.REVEALING,
       RoundStatus.ROUND_ENDED,
       RoundStatus.ROUND_CANCELLED
     ].includes(this.round.status);
 
-    player.playerName = playerName;
-    player.lastSeenAt = Date.now();
-
     if (lateJoinPhase) {
       await this.persistVisibleState();
-      await this.broadcastSnapshots(player.playerId);
       return {
         ok: true,
         sessionId: this.session.sessionId,
@@ -210,7 +311,9 @@ export class SessionRuntime {
     if (!player.hasJoinedRound) {
       player.hasJoinedRound = true;
       player.joinedAt = Date.now();
-      player.participationLabel = ParticipationLabel.JOINED_ACTIVE;
+      player.participationLabel = player.isConnected
+        ? ParticipationLabel.JOINED_ACTIVE
+        : ParticipationLabel.REGISTERED_ABSENT;
       this.round.joinedPlayerIdsForRound.push(playerId);
       await dispatchWebhook(
         WebhookEventType.PLAYER_JOINED,
@@ -232,7 +335,6 @@ export class SessionRuntime {
         : this.round.firstJoinAt + config.firstJoinTimeoutMs;
       this.round.status = RoundStatus.JOIN_WINDOW_OPEN;
       this.session.status = SessionStatus.ROUND_ACTIVE;
-      this.scheduleJoinDeadline();
       await this.appendEvent('round.join_window_started', { playerId });
       await dispatchWebhook(
         WebhookEventType.ROUND_JOIN_WINDOW_STARTED,
@@ -245,10 +347,11 @@ export class SessionRuntime {
           reason: 'first_join'
         })
       );
+      this.scheduleJoinDeadline();
     }
 
     await this.persistVisibleState();
-    await this.broadcastSnapshots();
+    this.emitReadyStatus();
 
     if (this.getJoinedCount() === this.round.expectedPlayerCountForRound) {
       await this.enterReadyCheck('all_players_joined');
@@ -263,8 +366,7 @@ export class SessionRuntime {
   }
 
   async handleHello(ws, message) {
-    const playerId = message.playerId || message.playerID;
-    const playerName = message.playerName || '';
+    const playerId = String(message.playerId || message.playerID || '').trim();
     const player = findPlayer(this.players, playerId);
     if (!player) {
       sendError(ws, 'PLAYER_NOT_REGISTERED', 'Player is not registered for this session');
@@ -272,26 +374,18 @@ export class SessionRuntime {
     }
 
     const wasDisconnected = player.participationLabel === ParticipationLabel.DISCONNECTED;
-    player.playerName = playerName || player.playerName;
+    player.playerName = normalizePlayerName(message.playerName) || player.playerName || player.playerId;
     player.isConnected = true;
     player.lastSeenAt = Date.now();
     player.participationLabel = player.hasJoinedRound
       ? ParticipationLabel.RECONNECTED
       : ParticipationLabel.REGISTERED_ABSENT;
 
-    this.attachConnection(playerId, ws);
-
-    send(ws, ServerMessageType.WELCOME, {
-      playerId,
-      playerName: player.playerName,
-      sessionId: this.session.sessionId,
-      roundId: this.round.roundId,
-      sessionStatus: this.session.status,
-      roundStatus: this.round.status
-    });
-
+    this.attachConnection(player.playerId, ws);
+    send(ws, ServerMessageType.WELCOME, this.buildWelcome(player));
+    this.emitReadyStatus(player.playerId);
+    this.sendRuntimeStateToPlayer(player);
     await this.persistVisibleState();
-    await this.broadcastSnapshots();
 
     if (wasDisconnected) {
       await dispatchWebhook(
@@ -310,53 +404,34 @@ export class SessionRuntime {
 
   scheduleJoinDeadline() {
     this.clearTimer('joinDeadline');
-
-    this.broadcast(ServerMessageType.JOIN_WINDOW_STARTED, {
-      sessionId: this.session.sessionId,
-      roundId: this.round.roundId,
-      roundNumber: this.round.roundNumber,
-      joinDeadlineAt: config.devWaitForAllPlayers ? null : this.round.joinDeadlineAt
-    });
-
     if (config.devWaitForAllPlayers || !this.round.joinDeadlineAt) {
       return;
     }
 
-    const delay = Math.max(0, this.round.joinDeadlineAt - Date.now());
     this.timers.joinDeadline = setTimeout(() => {
       this.handleJoinDeadline().catch((error) => console.error(error));
-    }, delay);
+    }, Math.max(0, this.round.joinDeadlineAt - Date.now()));
   }
 
-  async enterReadyCheck(reason = 'all_players_joined') {
+  async enterReadyCheck() {
     if (this.round.status !== RoundStatus.JOIN_WINDOW_OPEN) {
       return;
     }
 
     this.clearTimer('joinDeadline');
     this.clearTimer('readyCheck');
-
-    const readyCheckStartedAt = Date.now();
     this.round.status = RoundStatus.READY_CHECK;
     this.round.gatePlayerIdsForRound = [...this.round.registeredPlayerIdsForRound];
     this.round.readyPlayerIdsForRound = [];
-    this.round.readyCheckStartedAt = readyCheckStartedAt;
-    this.round.readyCheckDeadlineAt = readyCheckStartedAt + config.readyCheckTimeoutMs;
+    this.round.readyCheckStartedAt = Date.now();
+    this.round.readyCheckDeadlineAt = this.round.readyCheckStartedAt + config.readyCheckTimeoutMs;
 
     for (const player of this.players) {
       player.isReadyForRound = false;
     }
 
     await this.persistVisibleState();
-    this.broadcast(ServerMessageType.READY_CHECK_STARTED, {
-      roundId: this.round.roundId,
-      roundNumber: this.round.roundNumber,
-      reason,
-      readyCheckStartedAt: this.round.readyCheckStartedAt,
-      readyCheckDeadlineAt: this.round.readyCheckDeadlineAt,
-      expectedReadyPlayerCount: this.round.gatePlayerIdsForRound.length
-    });
-    await this.broadcastSnapshots();
+    this.emitReadyStatus();
 
     this.timers.readyCheck = setTimeout(() => {
       this.handleReadyCheckDeadline().catch((error) => console.error(error));
@@ -365,7 +440,7 @@ export class SessionRuntime {
 
   async handleRoundReady(playerId) {
     if (this.round.status !== RoundStatus.READY_CHECK) {
-      return { ok: false, error: 'ROUND_NOT_WAITING_FOR_READY' };
+      return { ok: false, error: 'READY_CLOSED' };
     }
 
     if (!this.round.gatePlayerIdsForRound.includes(playerId)) {
@@ -385,7 +460,7 @@ export class SessionRuntime {
     player.lastSeenAt = Date.now();
     this.round.readyPlayerIdsForRound.push(playerId);
     await this.persistVisibleState();
-    await this.broadcastSnapshots();
+    this.emitReadyStatus();
 
     if (this.round.readyPlayerIdsForRound.length >= this.round.gatePlayerIdsForRound.length) {
       await this.startRound('all_players_ready');
@@ -405,7 +480,7 @@ export class SessionRuntime {
     }
 
     await this.persistVisibleState();
-    await this.broadcastSnapshots();
+    this.emitReadyStatus();
     await this.startRound('ready_timeout_elapsed');
   }
 
@@ -422,6 +497,7 @@ export class SessionRuntime {
       this.session.endReason = 'joined_below_minimum';
       await this.persistVisibleState();
       await this.appendEvent('round.cancelled', { joinedCount });
+
       const sessionEndedPayload = buildSessionEndedPayload({
         eventName: WebhookEventType.SESSION_ENDED,
         session: this.session,
@@ -439,11 +515,10 @@ export class SessionRuntime {
       );
       await dispatchWebhook(WebhookEventType.SESSION_ENDED, sessionEndedPayload);
       await notifyMatchmakingSessionClosed(sessionEndedPayload);
-      this.broadcast(ServerMessageType.SESSION_ENDED, {
-        sessionId: this.session.sessionId,
-        reason: this.round.roundEndReason
+      this.broadcast(ServerMessageType.ERROR, {
+        code: 'SESSION_ENDED',
+        message: this.round.roundEndReason
       });
-      await this.broadcastSnapshots();
       await this.releasePlayerLocks(this.session.registeredPlayerIds);
       await redisStore.removeActiveSession(this.session.sessionId);
       return;
@@ -490,36 +565,50 @@ export class SessionRuntime {
       player.swapRequested = false;
       player.swapMatched = false;
       player.swapState = SwapState.NONE;
-      player.participationLabel = player.isConnected
+      player.softLockSource = null;
+      player.result = null;
+      player.participationLabel = player.hasJoinedRound
         ? ParticipationLabel.JOINED_ACTIVE
         : ParticipationLabel.REGISTERED_ABSENT;
     }
-
-    const distributionStartedAt = Date.now();
-    const distributionDurationMs =
-      getDistributionDurationMs({
-        totalPlayers: this.round.expectedPlayerCountForRound,
-        containerSize: CONTAINER_SIZE
-      }) + config.distributionBufferMs;
 
     this.round.status = RoundStatus.DISTRIBUTING;
     this.round.gatePlayerIdsForRound = [];
     this.round.readyCheckStartedAt = null;
     this.round.readyCheckDeadlineAt = null;
     this.round.readyPlayerIdsForRound = [];
-    this.round.distributionStartedAt = distributionStartedAt;
-    this.round.distributionEndsAt = distributionStartedAt + distributionDurationMs;
-    this.round.swapStartedAt = null;
-    this.round.swapActionClosesAt = null;
-    this.round.swapEndsAt = null;
+    this.round.distributionStartedAt = Date.now();
+    this.round.distributionDurationMs = config.distributionLeadMs;
+    this.round.distributionEndsAt = this.round.distributionStartedAt + this.round.distributionDurationMs;
+    this.round.distributionPackage = {
+      phase: 'distribution',
+      distributionStartedAt: this.round.distributionStartedAt,
+      distributionEndsAt: this.round.distributionEndsAt,
+      totalPlayers: this.round.expectedPlayerCountForRound,
+      containerSize: CONTAINER_SIZE
+    };
+    this.round.swapStartedAt = this.round.distributionEndsAt;
+    this.round.swapActionClosesAt = Math.min(
+      this.round.swapStartedAt +
+        getSwapActionCloseOffsetMs({
+          swapPhaseMs: config.swapPhaseMs,
+          softLockPercent: config.swapSoftLockPercent
+        }),
+      this.round.swapStartedAt + config.swapPhaseMs
+    );
+    this.round.swapEndsAt = this.round.swapStartedAt + config.swapPhaseMs;
     this.round.swapClosedAt = null;
+    this.round.swapPackage = {
+      phase: 'swap',
+      swapStartedAt: this.round.swapStartedAt,
+      swapActionClosesAt: this.round.swapActionClosesAt,
+      swapEndsAt: this.round.swapEndsAt,
+      softLockPercent: config.swapSoftLockPercent
+    };
     this.round.revealAt = null;
-    this.round.preResultStartedAt = null;
-    this.round.preResultReadyDeadlineAt = null;
     this.round.finalResultsReleaseAt = null;
     this.round.finalResultsSentAt = null;
-    this.round.preResultExpectedReadyPlayerIds = [];
-    this.round.preResultReadyPlayerIds = [];
+    this.session.status = SessionStatus.ROUND_ACTIVE;
     await this.persistVisibleState();
     await this.appendEvent('round.started', { reason });
     await dispatchWebhook(
@@ -534,26 +623,9 @@ export class SessionRuntime {
       })
     );
 
-    this.broadcast(ServerMessageType.ROUND_STARTED, {
-      roundId: this.round.roundId,
-      roundNumber: this.round.roundNumber,
-      reason,
-      distributionStartedAt: this.round.distributionStartedAt,
-      distributionEndsAt: this.round.distributionEndsAt
-    });
-
     for (const player of this.players) {
-      this.broadcast(
-        ServerMessageType.BOX_ASSIGNED,
-        {
-          playerId: player.playerId,
-          boxNumber: player.initialBoxNumber
-        },
-        player.playerId
-      );
+      this.sendToPlayer(player.playerId, ServerMessageType.SESSION_INIT, this.buildSessionInitFor(player));
     }
-
-    await this.broadcastSnapshots();
 
     this.timers.distribution = setTimeout(() => {
       this.openSwapWindow().catch((error) => console.error(error));
@@ -563,36 +635,15 @@ export class SessionRuntime {
   async openSwapWindow() {
     if (this.round.status !== RoundStatus.DISTRIBUTING) return;
 
-    const swapStartedAt = Date.now();
-    const swapActionOffsetMs = getSwapActionCloseOffsetMs({
-      swapPhaseMs: config.swapPhaseMs,
-      softLockPercent: config.swapSoftLockPercent
-    });
-
     this.round.status = RoundStatus.SWAP_OPEN;
-    this.round.swapStartedAt = swapStartedAt;
-    this.round.swapActionClosesAt = Math.min(
-      swapStartedAt + swapActionOffsetMs,
-      swapStartedAt + config.swapPhaseMs
-    );
-    this.round.swapEndsAt = swapStartedAt + config.swapPhaseMs;
-    this.round.swapClosedAt = null;
-    this.round.revealAt = null;
     await this.persistVisibleState();
-
-    this.broadcast(ServerMessageType.SWAP_WINDOW_OPEN, {
-      swapStartedAt: this.round.swapStartedAt,
-      swapActionClosesAt: this.round.swapActionClosesAt,
-      swapEndsAt: this.round.swapEndsAt,
-      revealAt: null
-    });
-    await this.broadcastSnapshots();
 
     this.clearTimer('swapSoftLock');
     this.timers.swapSoftLock = setTimeout(() => {
       this.applySwapSoftLock().catch((error) => console.error(error));
     }, Math.max(0, this.round.swapActionClosesAt - Date.now()));
 
+    this.clearTimer('swapClose');
     this.timers.swapClose = setTimeout(() => {
       this.closeSwapWindow().catch((error) => console.error(error));
     }, Math.max(0, this.round.swapEndsAt - Date.now()));
@@ -600,15 +651,15 @@ export class SessionRuntime {
 
   async handleSwapRequest(playerId) {
     if (this.round.status !== RoundStatus.SWAP_OPEN) {
-      return { ok: false, error: 'SWAP_CLOSED' };
+      return { ok: false, error: 'SWAP_NOT_OPEN' };
     }
 
     const now = Date.now();
     if (this.round.swapEndsAt && now >= this.round.swapEndsAt) {
-      return { ok: false, error: 'SWAP_CLOSED' };
+      return { ok: false, error: 'SWAP_NOT_OPEN' };
     }
-    if (this.round.swapActionClosesAt && now >= this.round.swapActionClosesAt) {
-      return { ok: false, error: 'SWAP_SOFT_LOCKED' };
+    if (this.isSoftLockActive(now)) {
+      return { ok: false, error: 'SOFTLOCK_ACTIVE' };
     }
 
     const result = requestSwap({
@@ -621,8 +672,6 @@ export class SessionRuntime {
 
     await this.persistVisibleState();
     if (result.pending) {
-      this.broadcast(ServerMessageType.SWAP_PENDING, { playerId }, playerId);
-      await this.broadcastSnapshots();
       return result;
     }
 
@@ -639,31 +688,38 @@ export class SessionRuntime {
     );
 
     for (const swapPlayerId of [result.matched.firstPlayerId, result.matched.secondPlayerId]) {
-      const currentBox = this.boxes.find((box) => box.currentOwnerPlayerId === swapPlayerId);
-      this.broadcast(
-        ServerMessageType.SWAP_MATCHED,
-        {
-          playerId: swapPlayerId,
-          newBoxNumber: currentBox?.boxNumber || null
-        },
-        swapPlayerId
-      );
+      this.sendToPlayer(swapPlayerId, ServerMessageType.SWAP_RESULT, {
+        outcome: 'found',
+        partnerBox: this.getCurrentBoxNumber(swapPlayerId)
+      });
     }
-    await this.broadcastSnapshots();
+
     return result;
   }
 
   async handleKeepBox(playerId) {
     const player = findPlayer(this.players, playerId);
     if (!player) return { ok: false, error: 'PLAYER_NOT_FOUND' };
-    if (this.round.status !== RoundStatus.SWAP_OPEN) return { ok: false, error: 'SWAP_CLOSED' };
-    if (this.round.swapEndsAt && Date.now() >= this.round.swapEndsAt) return { ok: false, error: 'SWAP_CLOSED' };
-    if (player.swapState !== SwapState.NONE) return { ok: false, error: 'SWAP_ALREADY_USED' };
+    if (this.round.status !== RoundStatus.SWAP_OPEN) return { ok: false, error: 'SWAP_NOT_OPEN' };
+    if (this.round.swapEndsAt && Date.now() >= this.round.swapEndsAt) return { ok: false, error: 'SWAP_NOT_OPEN' };
+    if (this.isSoftLockActive()) return { ok: false, error: 'SOFTLOCK_ACTIVE' };
+
+    if (player.swapState === SwapState.KEPT) {
+      return { ok: false, error: 'BOX_ALREADY_KEPT' };
+    }
+    if (player.swapState !== SwapState.NONE) {
+      return { ok: false, error: 'SWAP_ALREADY_USED' };
+    }
 
     player.swapState = SwapState.KEPT;
-    this.swaps.keepers.push({ playerId, keptAt: Date.now(), auto: false });
+    player.softLockSource = 'MANUAL_KEEP';
+    this.swaps.keepers.push({
+      playerId,
+      keptAt: Date.now(),
+      auto: false
+    });
+    this.removePendingSwap(playerId);
     await this.persistVisibleState();
-    await this.broadcastSnapshots();
     return { ok: true };
   }
 
@@ -672,6 +728,7 @@ export class SessionRuntime {
     for (const player of this.players) {
       if (player.swapState !== SwapState.NONE) continue;
       player.swapState = SwapState.KEPT;
+      player.softLockSource = 'NONE';
       this.swaps.keepers.push({
         playerId: player.playerId,
         keptAt: Date.now(),
@@ -686,113 +743,38 @@ export class SessionRuntime {
     return closeSwaps({ players: this.players, swaps: this.swaps });
   }
 
-  broadcastSwapUnmatched(playerIds) {
-    for (const playerId of playerIds) {
-      this.broadcast(ServerMessageType.SWAP_UNMATCHED, { playerId }, playerId);
-    }
-  }
-
   async applySwapSoftLock() {
     this.clearTimer('swapSoftLock');
-    if (this.round.status !== RoundStatus.SWAP_OPEN) return [];
+    if (this.round.status !== RoundStatus.SWAP_OPEN) {
+      return { unmatchedPlayerIds: [], autoKeptPlayerIds: [] };
+    }
+
+    const pendingPlayerIds = this.swaps.queue.map((entry) => entry.playerId);
+    for (const playerId of pendingPlayerIds) {
+      this.sendToPlayer(playerId, ServerMessageType.SOFTLOCK, {
+        finalBox: this.getCurrentBoxNumber(playerId),
+        priorSwapState: 'PENDING'
+      });
+    }
+
+    const autoKeptPlayerIds = this.autoKeepRemainingPlayers();
+    for (const playerId of autoKeptPlayerIds) {
+      this.sendToPlayer(playerId, ServerMessageType.SOFTLOCK, {
+        finalBox: this.getCurrentBoxNumber(playerId),
+        priorSwapState: 'NONE'
+      });
+    }
 
     const unmatchedPlayerIds = this.resolvePendingSwapsToUnmatched();
-    const autoKeptPlayerIds = this.autoKeepRemainingPlayers();
-    if (!unmatchedPlayerIds.length && !autoKeptPlayerIds.length) {
-      return {
-        unmatchedPlayerIds: [],
-        autoKeptPlayerIds: []
-      };
-    }
-
-    await this.persistVisibleState();
-    this.broadcastSwapUnmatched(unmatchedPlayerIds);
-    await this.broadcastSnapshots();
-    return {
-      unmatchedPlayerIds,
-      autoKeptPlayerIds
-    };
-  }
-
-  getPreResultExpectedReadyPlayerIds() {
-    return this.players
-      .filter((player) => player.isConnected)
-      .map((player) => player.playerId)
-      .sort();
-  }
-
-  async enterPreResultBarrier() {
-    const now = Date.now();
-    this.clearTimer('preResultReadyTimeout');
-    this.clearTimer('finalResultsRelease');
-
-    this.round.status = RoundStatus.REVEALING;
-    this.round.revealAt = now;
-    this.round.preResultStartedAt = now;
-    this.round.preResultReadyDeadlineAt = now + config.preResultReadyTimeoutMs;
-    this.round.finalResultsReleaseAt = null;
-    this.round.finalResultsSentAt = null;
-    this.round.preResultExpectedReadyPlayerIds = this.getPreResultExpectedReadyPlayerIds();
-    this.round.preResultReadyPlayerIds = [];
     await this.persistVisibleState();
 
-    this.broadcast(ServerMessageType.REVEAL_START, {
-      roundId: this.round.roundId,
-      roundNumber: this.round.roundNumber,
-      revealAt: this.round.revealAt,
-      preResultStartedAt: this.round.preResultStartedAt,
-      preResultReadyDeadlineAt: this.round.preResultReadyDeadlineAt,
-      finalResultsReleaseAt: this.round.finalResultsReleaseAt
-    });
-    await this.broadcastSnapshots();
-
-    if (!this.round.preResultExpectedReadyPlayerIds.length) {
-      await this.resolvePreResultBarrier();
-      return;
+    for (const playerId of unmatchedPlayerIds) {
+      this.sendToPlayer(playerId, ServerMessageType.SWAP_RESULT, {
+        outcome: 'not_found'
+      });
     }
 
-    this.timers.preResultReadyTimeout = setTimeout(() => {
-      this.resolvePreResultBarrier().catch((error) => console.error(error));
-    }, Math.max(0, this.round.preResultReadyDeadlineAt - Date.now()));
-  }
-
-  async handlePreResultReady(playerId) {
-    if (this.round.status !== RoundStatus.REVEALING) {
-      return { ok: true, ignored: true };
-    }
-    if (this.round.finalResultsReleaseAt || this.round.finalResultsSentAt) {
-      return { ok: true, ignored: true };
-    }
-    if (!this.round.preResultExpectedReadyPlayerIds.includes(playerId)) {
-      return { ok: true, ignored: true };
-    }
-    if (this.round.preResultReadyPlayerIds.includes(playerId)) {
-      return { ok: true, duplicate: true };
-    }
-
-    this.round.preResultReadyPlayerIds = [...this.round.preResultReadyPlayerIds, playerId].sort();
-    await this.persistVisibleState();
-
-    if (
-      this.round.preResultReadyPlayerIds.length >= this.round.preResultExpectedReadyPlayerIds.length
-    ) {
-      await this.resolvePreResultBarrier();
-    }
-    return { ok: true };
-  }
-
-  async resolvePreResultBarrier() {
-    if (this.round.status !== RoundStatus.REVEALING) return;
-    if (this.round.finalResultsReleaseAt || this.round.finalResultsSentAt) return;
-
-    this.clearTimer('preResultReadyTimeout');
-    this.round.finalResultsReleaseAt = Date.now() + config.preResultHoldMs;
-    await this.persistVisibleState();
-    await this.broadcastSnapshots();
-
-    this.timers.finalResultsRelease = setTimeout(() => {
-      this.releaseRoundResults().catch((error) => console.error(error));
-    }, Math.max(0, this.round.finalResultsReleaseAt - Date.now()));
+    return { unmatchedPlayerIds, autoKeptPlayerIds };
   }
 
   finalizePlayerResults() {
@@ -803,15 +785,15 @@ export class SessionRuntime {
       player.finalPrizeAmount = finalBox?.rewardAmount ?? 0;
       player.isWinner = !!finalBox?.isWinningBox;
       player.participationLabel = ParticipationLabel.ROUND_COMPLETE;
+      player.result = this.buildRoundResult(player);
     }
   }
 
-  async releaseRoundResults() {
-    if (this.round.status !== RoundStatus.REVEALING) return;
+  async publishResults() {
+    if (this.round.status !== RoundStatus.SWAP_CLOSED) return;
     if (this.round.finalResultsSentAt) return;
 
-    this.clearTimer('preResultReadyTimeout');
-    this.clearTimer('finalResultsRelease');
+    this.clearTimer('resultsRelease');
     this.finalizePlayerResults();
 
     this.round.finalResultsSentAt = Date.now();
@@ -821,29 +803,10 @@ export class SessionRuntime {
     await this.persistVisibleState();
 
     for (const player of this.players) {
-      this.broadcast(
-        ServerMessageType.PLAYER_RESULT,
-        {
-          playerId: player.playerId,
-          playerName: player.playerName,
-          initialBoxNumber: player.initialBoxNumber,
-          finalBoxNumber: player.finalBoxNumber,
-          wasSwapped: player.initialBoxId !== player.finalBoxId,
-          isWinner: player.isWinner,
-          prizeAmount: player.finalPrizeAmount
-        },
-        player.playerId
-      );
+      this.sendToPlayer(player.playerId, ServerMessageType.ROUND_RESULT, player.result);
     }
 
-    const roundResults = buildRoundResultsSnapshot({
-      session: this.session,
-      round: this.round,
-      players: this.players
-    });
-    this.broadcast(ServerMessageType.ROUND_RESULTS, roundResults);
-
-    const payload = buildRoundEndedPayload({
+    const roundEndedPayload = buildRoundEndedPayload({
       eventName: WebhookEventType.ROUND_ENDED,
       session: this.session,
       round: this.round,
@@ -851,7 +814,7 @@ export class SessionRuntime {
       boxes: this.boxes,
       swaps: this.swaps
     });
-    await dispatchWebhook(WebhookEventType.ROUND_ENDED, payload);
+    await dispatchWebhook(WebhookEventType.ROUND_ENDED, roundEndedPayload);
     await dispatchWebhook(
       WebhookEventType.SESSION_REPLAY_WAITING,
       buildSessionReplayWaitingPayload({
@@ -870,11 +833,6 @@ export class SessionRuntime {
       roundId: this.round.roundId
     });
 
-    this.broadcast(ServerMessageType.REPLAY_WAITING, {
-      replayWaitEndsAt
-    });
-    await this.broadcastSnapshots();
-
     this.timers.replayEnd = setTimeout(() => {
       this.endSession('replay_timeout').catch((error) => console.error(error));
     }, Math.max(0, replayWaitEndsAt - Date.now()));
@@ -882,33 +840,27 @@ export class SessionRuntime {
 
   async closeSwapWindow() {
     if (this.round.status !== RoundStatus.SWAP_OPEN) return;
+
     this.clearTimer('swapSoftLock');
     this.clearTimer('swapClose');
 
-    const unmatchedPlayerIds = this.resolvePendingSwapsToUnmatched();
-    this.autoKeepRemainingPlayers();
+    if (!this.isSoftLockActive()) {
+      this.autoKeepRemainingPlayers();
+      this.resolvePendingSwapsToUnmatched().forEach((playerId) => {
+        this.sendToPlayer(playerId, ServerMessageType.SWAP_RESULT, {
+          outcome: 'not_found'
+        });
+      });
+    }
 
     this.round.status = RoundStatus.SWAP_CLOSED;
     this.round.swapClosedAt = Date.now();
-    this.round.revealAt = this.round.swapClosedAt;
+    this.round.finalResultsReleaseAt = this.round.swapClosedAt + config.calcDelayMs;
     await this.persistVisibleState();
 
-    this.broadcastSwapUnmatched(unmatchedPlayerIds);
-
-    this.broadcast(ServerMessageType.SWAP_WINDOW_CLOSED, {
-      swapStartedAt: this.round.swapStartedAt,
-      swapActionClosesAt: this.round.swapActionClosesAt,
-      swapEndsAt: this.round.swapEndsAt,
-      swapClosedAt: this.round.swapClosedAt,
-      revealAt: this.round.revealAt
-    });
-    await this.broadcastSnapshots();
-    await this.enterPreResultBarrier();
-  }
-
-  async revealRound() {
-    if (this.round.status !== RoundStatus.SWAP_CLOSED) return;
-    await this.enterPreResultBarrier();
+    this.timers.resultsRelease = setTimeout(() => {
+      this.publishResults().catch((error) => console.error(error));
+    }, Math.max(0, this.round.finalResultsReleaseAt - Date.now()));
   }
 
   async handleSocketMessage(ws, message) {
@@ -918,7 +870,6 @@ export class SessionRuntime {
         if (player) {
           player.lastSeenAt = Date.now();
           if (!player.isConnected) player.isConnected = true;
-          await this.persist();
         }
         return;
       }
@@ -937,8 +888,19 @@ export class SessionRuntime {
         if (!result.ok) sendError(ws, result.error, 'Unable to keep box');
         return;
       }
-      case ClientMessageType.PRE_RESULT_READY: {
-        await this.handlePreResultReady(ws.playerId);
+      case ClientMessageType.TIMER_END:
+        return;
+      case ClientMessageType.LEADERBOARD_REQUEST: {
+        const player = findPlayer(this.players, ws.playerId);
+        if (!player || player.finalBoxNumber == null) {
+          sendError(ws, 'RESULTS_NOT_READY', 'Results are not ready yet.');
+          return;
+        }
+        this.sendToPlayer(
+          ws.playerId,
+          ServerMessageType.LEADERBOARD_DATA,
+          this.buildLeaderboardData(ws.playerId)
+        );
         return;
       }
       default:
@@ -950,27 +912,12 @@ export class SessionRuntime {
     const player = findPlayer(this.players, playerId);
     if (!player) return;
     if (!player.isConnected) return;
+
     player.isConnected = false;
     player.lastSeenAt = Date.now();
     player.participationLabel = ParticipationLabel.DISCONNECTED;
     this.detachConnection(playerId);
-
-    const shouldResolveBarrier =
-      this.round?.status === RoundStatus.REVEALING &&
-      !this.round.finalResultsReleaseAt &&
-      !this.round.finalResultsSentAt;
-
-    if (shouldResolveBarrier) {
-      this.round.preResultExpectedReadyPlayerIds = this.round.preResultExpectedReadyPlayerIds.filter(
-        (entry) => entry !== playerId
-      );
-      this.round.preResultReadyPlayerIds = this.round.preResultReadyPlayerIds.filter(
-        (entry) => entry !== playerId
-      );
-    }
-
     await this.persistVisibleState();
-    await this.broadcastSnapshots();
     await dispatchWebhook(
       WebhookEventType.PLAYER_DISCONNECTED,
       buildPlayerConnectionPayload({
@@ -982,19 +929,14 @@ export class SessionRuntime {
         reason
       })
     );
-
-    if (
-      shouldResolveBarrier &&
-      this.round.preResultReadyPlayerIds.length >= this.round.preResultExpectedReadyPlayerIds.length
-    ) {
-      await this.resolvePreResultBarrier();
-    }
   }
 
   async handleHeartbeatTimeouts(now) {
     for (const player of this.players) {
       if (!player.isConnected) continue;
       if (!player.lastSeenAt || now - player.lastSeenAt <= config.heartbeatTimeoutMs) continue;
+      const ws = this.connections.get(player.playerId);
+      ws?.terminate?.();
       await this.handleDisconnect(player.playerId, 'heartbeat_timeout');
     }
   }
@@ -1007,6 +949,7 @@ export class SessionRuntime {
     this.session.currentExpectedPlayerCount = playerIds.length;
     this.session.roundCount += 1;
     this.session.registeredPlayerIds = [...playerIds];
+
     const round = createRound({
       sessionId: this.session.sessionId,
       roundNumber: this.session.roundCount,
@@ -1014,22 +957,41 @@ export class SessionRuntime {
     });
     const players = createRoundPlayers(playerIds);
     await this.initializeNewRound(round, players);
+
+    const now = Date.now();
+    for (const [connectedPlayerId] of this.connections.entries()) {
+      const replayPlayer = findPlayer(this.players, connectedPlayerId);
+      if (!replayPlayer) {
+        this.detachConnection(connectedPlayerId);
+        continue;
+      }
+      replayPlayer.isConnected = true;
+      replayPlayer.lastSeenAt = now;
+      replayPlayer.participationLabel = ParticipationLabel.REGISTERED_ABSENT;
+    }
+
+    await this.persistVisibleState();
+    for (const playerId of playerIds) {
+      this.sendToPlayer(playerId, ServerMessageType.REPLAY_STARTED, {
+        sessionId: this.session.sessionId,
+        roundId: this.round.roundId,
+        roundNumber: this.round.roundNumber,
+        expectedPlayerCount: this.round.expectedPlayerCountForRound,
+        readyTimeoutMs: config.readyCheckTimeoutMs
+      });
+    }
+    this.emitReadyStatus();
     await dispatchWebhook(
       WebhookEventType.SESSION_REPLAY_STARTED,
       buildSessionReplayStartedPayload({
         eventName: WebhookEventType.SESSION_REPLAY_STARTED,
         session: this.session,
         round,
-        players,
+        players: this.players,
         replayPlayerIds: playerIds
       })
     );
-    this.broadcast(ServerMessageType.REPLAY_ACCEPTED, {
-      sessionId: this.session.sessionId,
-      roundId: round.roundId,
-      roundNumber: round.roundNumber
-    });
-    await this.broadcastSnapshots();
+
     if (removedPlayerIds.length) {
       await this.releasePlayerLocks(removedPlayerIds);
     }
@@ -1082,41 +1044,15 @@ export class SessionRuntime {
       return;
     }
 
-    if (this.round.status === RoundStatus.SWAP_CLOSED) {
-      await this.enterPreResultBarrier();
-      return;
-    }
-
-    if (this.round.status === RoundStatus.REVEALING) {
-      if (this.round.finalResultsReleaseAt) {
-        this.clearTimer('finalResultsRelease');
-        if (Date.now() >= this.round.finalResultsReleaseAt) {
-          await this.releaseRoundResults();
-        } else {
-          this.timers.finalResultsRelease = setTimeout(() => {
-            this.releaseRoundResults().catch((error) => console.error(error));
-          }, Math.max(0, this.round.finalResultsReleaseAt - Date.now()));
-        }
-        return;
+    if (this.round.status === RoundStatus.SWAP_CLOSED && this.round.finalResultsReleaseAt) {
+      this.clearTimer('resultsRelease');
+      if (Date.now() >= this.round.finalResultsReleaseAt) {
+        await this.publishResults();
+      } else {
+        this.timers.resultsRelease = setTimeout(() => {
+          this.publishResults().catch((error) => console.error(error));
+        }, Math.max(0, this.round.finalResultsReleaseAt - Date.now()));
       }
-
-      if (!this.round.preResultReadyDeadlineAt) {
-        await this.enterPreResultBarrier();
-        return;
-      }
-
-      if (
-        this.round.preResultReadyPlayerIds.length >= this.round.preResultExpectedReadyPlayerIds.length ||
-        Date.now() >= this.round.preResultReadyDeadlineAt
-      ) {
-        await this.resolvePreResultBarrier();
-        return;
-      }
-
-      this.clearTimer('preResultReadyTimeout');
-      this.timers.preResultReadyTimeout = setTimeout(() => {
-        this.resolvePreResultBarrier().catch((error) => console.error(error));
-      }, Math.max(0, this.round.preResultReadyDeadlineAt - Date.now()));
       return;
     }
 
@@ -1141,11 +1077,10 @@ export class SessionRuntime {
     });
     await dispatchWebhook(WebhookEventType.SESSION_ENDED, payload);
     await notifyMatchmakingSessionClosed(payload);
-    this.broadcast(ServerMessageType.SESSION_ENDED, {
-      sessionId: this.session.sessionId,
-      reason
+    this.broadcast(ServerMessageType.ERROR, {
+      code: 'SESSION_ENDED',
+      message: reason
     });
-    await this.broadcastSnapshots();
     await this.releasePlayerLocks(this.session.registeredPlayerIds);
     await redisStore.removeActiveSession(this.session.sessionId);
   }

@@ -10,5 +10,5 @@ export function send(ws, type, payload = {}) {
 }
 
 export function sendError(ws, code, message) {
-  send(ws, 'ERROR', { code, message });
+  send(ws, 'error', { code, message });
 }

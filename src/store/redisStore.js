@@ -22,6 +22,7 @@ class RedisStore {
       this.connected = true;
       return;
     }
+
     const { createClient } = await import('redis');
     this.client = createClient({
       url: config.redisUrl,

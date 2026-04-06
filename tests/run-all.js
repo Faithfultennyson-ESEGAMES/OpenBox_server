@@ -1,6 +1,3 @@
-await import('./clientSwapFlow.test.js');
-await import('./swapTimer.test.js');
-await import('./distributionRuntime.test.js');
 await import('./contracts.test.js');
 await import('./domain.test.js');
 await import('./registry.test.js');

@@ -6,6 +6,7 @@ import config from '../config.js';
 import { signJsonPayload } from '../security/hmac.js';
 
 export const DLQ_DIR = () => config.dlqDir;
+let dlqSweepTimer = null;
 
 function wait(ms) {
   if (!ms || ms <= 0) return Promise.resolve();
@@ -14,6 +15,38 @@ function wait(ms) {
 
 async function ensureDlqDir() {
   await fs.mkdir(DLQ_DIR(), { recursive: true });
+}
+
+function isDlqExpired(item, now = Date.now()) {
+  if (!Number.isFinite(config.dlqRetentionMs) || config.dlqRetentionMs <= 0) return false;
+  const failedAt = Date.parse(item?.failedAt || '');
+  if (!Number.isFinite(failedAt)) return false;
+  return failedAt + config.dlqRetentionMs <= now;
+}
+
+export async function purgeExpiredDlqItems(now = Date.now()) {
+  await ensureDlqDir();
+  const files = await fs.readdir(DLQ_DIR()).catch((error) => {
+    if (error?.code === 'ENOENT') return [];
+    throw error;
+  });
+  let purgedCount = 0;
+
+  for (const file of files.filter((entry) => entry.endsWith('.json'))) {
+    const filePath = path.join(DLQ_DIR(), file);
+    try {
+      const raw = await fs.readFile(filePath, 'utf8');
+      const payload = JSON.parse(raw);
+      if (!isDlqExpired(payload, now)) continue;
+      await fs.unlink(filePath);
+      purgedCount += 1;
+    } catch (error) {
+      if (error?.code === 'ENOENT') continue;
+      console.error('[DLQ] Failed to evaluate retention for', filePath, error);
+    }
+  }
+
+  return purgedCount;
 }
 
 function buildHeaders(eventType, payload) {
@@ -156,6 +189,38 @@ export async function sendWebhookWithRetry({
   };
 }
 
+export async function dispatchWebhookEndpoint({
+  endpoint,
+  payload,
+  eventType,
+  fetchImpl = fetch,
+  timeoutMs = config.webhookTimeoutMs,
+  retryScheduleMs = config.webhookRetryScheduleMs,
+  maxAttempts = config.maxWebhookAttempts,
+  persistFailures = true
+}) {
+  if (!endpoint) {
+    return {
+      ok: false,
+      skipped: true,
+      reason: 'endpoint_not_configured'
+    };
+  }
+
+  await ensureDlqDir();
+
+  return sendWebhookWithRetry({
+    endpoint,
+    payload,
+    eventType,
+    fetchImpl,
+    timeoutMs,
+    retryScheduleMs,
+    maxAttempts,
+    persistFailures
+  });
+}
+
 export async function dispatchWebhook(eventType, payload) {
   if (!Object.values(WebhookEventType).includes(eventType)) {
     console.warn(`[Webhook] Unknown event type ${eventType}`);
@@ -170,7 +235,7 @@ export async function dispatchWebhook(eventType, payload) {
 
   return Promise.all(
     config.webhookEndpoints.map((endpoint) =>
-      sendWebhookWithRetry({
+      dispatchWebhookEndpoint({
         endpoint,
         payload,
         eventType
@@ -181,6 +246,7 @@ export async function dispatchWebhook(eventType, payload) {
 
 export async function listDlqItems() {
   try {
+    await purgeExpiredDlqItems();
     await ensureDlqDir();
     const files = await fs.readdir(DLQ_DIR());
     const items = [];
@@ -208,14 +274,22 @@ export async function listDlqItems() {
 }
 
 export async function readDlqItem(id) {
+  await purgeExpiredDlqItems();
   const filePath = path.join(DLQ_DIR(), `${id}.json`);
   const raw = await fs.readFile(filePath, 'utf8');
-  return JSON.parse(raw);
+  const payload = JSON.parse(raw);
+  if (isDlqExpired(payload)) {
+    await fs.unlink(filePath).catch(() => {});
+    const error = new Error('DLQ item not found');
+    error.code = 'ENOENT';
+    throw error;
+  }
+  return payload;
 }
 
 export async function resendDlqItem(id, fetchImpl = fetch) {
   const item = await readDlqItem(id);
-  const result = await sendWebhookWithRetry({
+  const result = await dispatchWebhookEndpoint({
     endpoint: item.endpoint,
     payload: item.webhookPayload,
     eventType: item.eventName,
@@ -245,4 +319,17 @@ export async function clearDlq() {
 
 export async function initWebhookDispatcher() {
   await ensureDlqDir();
+  await purgeExpiredDlqItems();
+
+  if (dlqSweepTimer) {
+    clearInterval(dlqSweepTimer);
+    dlqSweepTimer = null;
+  }
+
+  if (Number.isFinite(config.dlqSweepIntervalMs) && config.dlqSweepIntervalMs > 0) {
+    dlqSweepTimer = setInterval(() => {
+      purgeExpiredDlqItems().catch((error) => console.error('[DLQ] Sweep failed', error));
+    }, config.dlqSweepIntervalMs);
+    dlqSweepTimer.unref?.();
+  }
 }

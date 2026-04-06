@@ -17,7 +17,7 @@ export const TWO_D_DISTRIBUTION_TIMINGS = Object.freeze({
 });
 
 export function clampPlayerCount(playerCount) {
-  return Math.max(5, Math.min(50, Number(playerCount || 0)));
+  return Math.max(2, Math.min(50, Number(playerCount || 0)));
 }
 
 export function buildContainers(totalPlayers, containerSize = CONTAINER_SIZE) {

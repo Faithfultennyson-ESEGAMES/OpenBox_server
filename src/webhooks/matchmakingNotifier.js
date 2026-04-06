@@ -1,53 +1,25 @@
 import config from '../config.js';
-import { signJsonPayload } from '../security/hmac.js';
+import { dispatchWebhookEndpoint } from './dispatcher.js';
 
 export async function notifyMatchmakingSessionClosed(payload, fetchImpl = fetch) {
   if (!config.matchmakingServiceUrl || !config.hmacSecret) {
     return { ok: false, skipped: true, reason: 'not_configured' };
   }
+  const result = await dispatchWebhookEndpoint({
+    endpoint: config.matchmakingServiceUrl,
+    payload,
+    eventType: payload?.eventName || 'session.ended',
+    fetchImpl
+  });
 
-  const body = JSON.stringify(payload);
-  const signature = signJsonPayload(body);
-  const headers = {
-    'content-type': 'application/json',
-    'x-event-type': payload.eventName || 'session.ended'
-  };
-
-  if (payload?.eventId) {
-    headers['x-event-id'] = payload.eventId;
-  }
-  if (signature) {
-    headers['x-hub-signature-256'] = signature;
-  }
-
-  try {
-    const response = await fetchImpl(config.matchmakingServiceUrl, {
-      method: 'POST',
-      headers,
-      body,
-      signal: AbortSignal.timeout(config.webhookTimeoutMs)
-    });
-
-    if (!response.ok) {
-      console.error(
-        `[MatchmakingNotifier] Matchmaking callback failed for ${payload?.sessionId || 'unknown'} with status ${response.status}`
-      );
-    }
-
-    return {
-      ok: response.ok,
-      status: response.status
-    };
-  } catch (error) {
+  if (!result.ok && !result.skipped) {
     console.error(
-      `[MatchmakingNotifier] Failed to send session closure for ${payload?.sessionId || 'unknown'}:`,
-      error?.message || error
+      `[MatchmakingNotifier] Matchmaking callback failed for ${payload?.sessionId || 'unknown'}:`,
+      result.error || result.reason || result.status || 'unknown_error'
     );
-    return {
-      ok: false,
-      error: error?.message || 'unknown_error'
-    };
   }
+
+  return result;
 }
 
 export default notifyMatchmakingSessionClosed;

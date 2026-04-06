@@ -9,6 +9,15 @@ import {
 } from '../src/shared/twod.js';
 
 test('container builder uses 12-box groups and only renders the required container count', () => {
+  assert.equal(buildContainers(2, CONTAINER_SIZE).length, 1);
+  assert.deepEqual(buildContainers(2, CONTAINER_SIZE)[0], {
+    id: 0,
+    label: 'A',
+    start: 1,
+    end: 2,
+    boxes: [1, 2],
+    count: 2
+  });
   assert.equal(buildContainers(12, CONTAINER_SIZE).length, 1);
   assert.equal(buildContainers(24, CONTAINER_SIZE).length, 2);
   assert.equal(buildContainers(50, CONTAINER_SIZE).length, 5);

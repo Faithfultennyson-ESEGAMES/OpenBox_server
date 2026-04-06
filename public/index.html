@@ -1,0 +1,155 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0">
+  <title>Open Box Multiplayer</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Black+Ops+One&family=Cinzel+Decorative:wght@700;900&family=Cinzel:wght@400;600;700&family=Lato:wght@300;400;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <div class="shell-stage" id="shellStage">
+    <div class="shell-fit" id="shellFit">
+      <div class="phone" id="phone">
+        <div class="corner c-tl"></div>
+        <div class="corner c-tr"></div>
+        <div class="corner c-bl"></div>
+        <div class="corner c-br"></div>
+        <div class="felt"></div>
+
+        <div class="game-ui">
+          <div class="hud">
+            <div class="p-chip">
+              <div class="p-av" id="playerAv">&mdash;</div>
+              <div>
+                <div class="p-name" id="playerName">Connecting&hellip;</div>
+                <div class="p-stake" id="playerStake">&mdash;</div>
+              </div>
+            </div>
+            <div id="hudRight"><div class="t-ghost"></div></div>
+          </div>
+
+          <div class="gdiv"></div>
+          <div class="badge-row"><div class="badge b-dist" id="gameBadge">📦 Distributing Boxes</div></div>
+
+          <div class="arena" id="arena">
+            <div class="stage-glow" id="stageGlow"></div>
+            <div class="carousel-vp" id="carouselVp">
+              <div class="carousel-track" id="carouselTrack"></div>
+            </div>
+            <div class="carousel-dots off" id="carouselDots" style="bottom:4.5rem;"></div>
+            <div class="track-wrap" id="trackWrap">
+              <svg class="track-svg" id="trackSvg" viewBox="0 0 390 110" preserveAspectRatio="none" style="height:6.875rem;">
+                <path d="M 420,22 C 340,70 265,88 195,86 C 125,84 50,64 -30,22" fill="none" stroke="rgba(0,0,0,.7)" stroke-width="30" stroke-linecap="round"/>
+                <path d="M 420,22 C 340,70 265,88 195,86 C 125,84 50,64 -30,22" fill="none" stroke="#131310" stroke-width="26" stroke-linecap="round"/>
+                <path d="M 420,22 C 340,70 265,88 195,86 C 125,84 50,64 -30,22" fill="none" stroke="rgba(201,146,10,.3)" stroke-width="28" stroke-linecap="round"/>
+                <path d="M 420,22 C 340,70 265,88 195,86 C 125,84 50,64 -30,22" fill="none" stroke="rgba(232,176,32,.55)" stroke-width="1.5" stroke-linecap="round" stroke-dasharray="14,10">
+                  <animate attributeName="stroke-dashoffset" from="0" to="-48" dur="1.2s" repeatCount="indefinite"/>
+                </path>
+                <path id="trackCalcPath" d="M 420,22 C 340,70 265,88 195,86 C 125,84 50,64 -30,22" fill="none" stroke="none"/>
+              </svg>
+            </div>
+
+            <div class="player-box" id="playerBox">
+              <div class="box-num" id="playerNum">?</div>
+              <div class="box-lock" id="playerLock">LOCKED</div>
+              <div class="box-halo"></div>
+            </div>
+            <div class="yb-label" id="ybLabel">YOUR BOX</div>
+            <div class="session-ctr">
+              <div class="sc-dot"></div>
+              <span id="sessionCtrTxt">&mdash; players &middot; &mdash; boxes in session</span>
+              <div class="sc-dot" style="animation-delay:.8s;"></div>
+            </div>
+          </div>
+
+          <div class="status-area">
+            <div class="st-title" id="stTitle">Connecting&hellip;</div>
+            <div class="st-sub" id="stSub">Waiting for server&hellip;</div>
+          </div>
+
+          <div class="action-bar">
+            <div id="progWrap" class="prog-wrap">
+              <div class="prog-track"><div class="prog-fill" id="progFill"></div></div>
+              <div class="prog-label" id="progLabel">Waiting for session&hellip;</div>
+            </div>
+            <div class="swap-actions" id="swapActions">
+              <button class="btn-swap btn-keep disabled" id="keepBtn">Keep Box</button>
+              <button class="btn-swap btn-swap-main disabled" id="swapBtn">Swap Box</button>
+            </div>
+            <div class="btn-note" id="btnNote">Swap window opens after delivery</div>
+          </div>
+        </div>
+
+        <div class="ol ol-ready on" id="s-ready">
+          <div class="ready-card">
+            <div class="ready-eyebrow">Session Lobby</div>
+            <div class="ready-title" id="readyTitle">Connecting to Session</div>
+            <div class="ready-copy" id="readyCopy">Waiting for your connection to complete.</div>
+            <div class="ready-stats">
+              <div class="ready-stat"><span>Joined</span><strong id="readyJoined">0 / 0</strong></div>
+              <div class="ready-stat"><span>Ready</span><strong id="readyCount">0</strong></div>
+              <div class="ready-stat"><span>Timer</span><strong id="readyTimer">--</strong></div>
+            </div>
+            <button class="ready-btn" id="readyBtn" disabled>Ready</button>
+            <div class="ready-hint" id="readyHint">Waiting for all players to join.</div>
+          </div>
+        </div>
+
+        <div class="ol ol-loading" id="s-loading">
+          <div class="ls-orb"><div class="ls-icon" id="ls-icon">📦</div></div>
+          <div class="ls-title" id="ls-title">Revealing Results</div>
+          <div class="ls-sub">Opening all boxes&hellip;</div>
+          <div class="ls-segs" id="ls-segs"></div>
+          <div class="ls-dots"><div class="ls-dot"></div><div class="ls-dot"></div><div class="ls-dot"></div><div class="ls-dot"></div><div class="ls-dot"></div></div>
+          <div class="ls-await" id="ls-await">Awaiting server confirmation&hellip;</div>
+        </div>
+
+        <div class="ol ol-win" id="s-win">
+          <div class="conf-layer" id="confLayer"></div>
+          <div class="result-header"><div class="rh-icon">🏆</div><div class="rh-eyebrow">You Won!</div></div>
+          <div class="prize-card pc-win">
+            <div class="pc-eyebrow">Your Prize</div>
+            <span class="pc-emoji">🤑</span>
+            <div class="pc-amount" id="winAmount">&#x20A6;0</div>
+            <div class="pc-detail" id="winDetail">--</div>
+          </div>
+          <button class="btn-next" onclick="goTo('s-lb')">Continue &mdash; View All Results</button>
+          <div class="cd-note">Auto-advancing in <span id="winSecs">5</span>s</div>
+        </div>
+
+        <div class="ol ol-lose" id="s-lose">
+          <div class="result-header"><div class="rh-icon">😔</div><div class="rh-eyebrow">Better Luck Next Time</div></div>
+          <div class="prize-card pc-lose">
+            <div class="pc-eyebrow">Your Result</div>
+            <span class="pc-emoji">😶</span>
+            <div class="pc-amount">&#x20A6;0</div>
+            <div class="pc-detail" id="loseDetail">--</div>
+            <div class="pc-lose-note">No prize this round. The reward pool was distributed among winning boxes.</div>
+          </div>
+          <button class="btn-next" onclick="goTo('s-lb')">Continue &mdash; View All Results</button>
+          <div class="cd-note">Auto-advancing in <span id="loseSecs">5</span>s</div>
+        </div>
+
+        <div class="ol ol-lb" id="s-lb">
+          <div class="lb-header">
+            <div class="lb-divider-line"></div>
+            <div class="lb-title">Final Results</div>
+            <div class="lb-meta" id="lbMeta">Loading&hellip;</div>
+            <div class="lb-divider-line"></div>
+          </div>
+          <div class="lb-list" id="lbList"></div>
+          <div class="lb-footer">
+            <div><div class="lb-pool-lbl">Reward Pool</div><div class="lb-pool-val" id="lbPoolVal">&mdash;</div></div>
+            <div class="lb-session" id="lbSession">Session &mdash;<br>Round 1</div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <script src="/app.js"></script>
+</body>
+</html>

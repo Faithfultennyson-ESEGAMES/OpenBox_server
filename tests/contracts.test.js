@@ -7,10 +7,9 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import config from '../src/config.js';
 import { validateEnv } from '../src/config/validateEnv.js';
-import { RoundStatus, SessionStatus, SwapState } from '../src/shared/protocol.js';
+import { RoundStatus, SessionStatus } from '../src/shared/protocol.js';
 import { validateStartPayload } from '../src/http/validation.js';
 import routes from '../src/http/routes.js';
-import { buildSessionSnapshot } from '../src/runtime/snapshot.js';
 import {
   buildRoundEndedPayload,
   buildRoundStartedPayload,
@@ -21,48 +20,218 @@ import {
 import { createRound, createRoundPlayers, createSessionContainer } from '../src/domain/sessionState.js';
 import sessionRegistry from '../src/runtime/sessionRegistry.js';
 
+function createTestApp() {
+  const app = express();
+  app.use(express.json());
+  app.use(routes);
+  return app;
+}
+
 test('validateStartPayload accepts valid payloads', () => {
   const result = validateStartPayload({
-    playerCount: 5,
+    playerCount: 2,
     stakeAmount: 1000,
-    playerIds: ['p1', 'p2', 'p3', 'p4', 'p5']
+    playerIds: ['p1', 'p2']
   });
 
   assert.deepEqual(result, {
     ok: true,
-    playerCount: 5,
+    playerCount: 2,
     stakeAmount: 1000,
-    playerIds: ['p1', 'p2', 'p3', 'p4', 'p5']
+    playerIds: ['p1', 'p2']
   });
 });
 
 test('validateStartPayload rejects invalid player counts, mismatches, duplicates, and stake', () => {
-  assert.equal(validateStartPayload({ playerCount: 4, stakeAmount: 1000, playerIds: ['p1', 'p2', 'p3', 'p4'] }).ok, false);
+  assert.equal(validateStartPayload({ playerCount: 1, stakeAmount: 1000, playerIds: ['p1'] }).ok, false);
   assert.equal(validateStartPayload({ playerCount: 51, stakeAmount: 1000, playerIds: Array.from({ length: 51 }, (_, i) => `p${i}`) }).ok, false);
-  assert.equal(validateStartPayload({ playerCount: 5, stakeAmount: 1000, playerIds: ['p1', 'p2'] }).ok, false);
-  assert.equal(validateStartPayload({ playerCount: 5, stakeAmount: 1000, playerIds: ['p1', 'p1', 'p3', 'p4', 'p5'] }).ok, false);
-  assert.equal(validateStartPayload({ playerCount: 5, stakeAmount: 0, playerIds: ['p1', 'p2', 'p3', 'p4', 'p5'] }).ok, false);
+  assert.equal(validateStartPayload({ playerCount: 2, stakeAmount: 1000, playerIds: ['p1'] }).ok, false);
+  assert.equal(validateStartPayload({ playerCount: 2, stakeAmount: 1000, playerIds: ['p1', 'p1'] }).ok, false);
+  assert.equal(validateStartPayload({ playerCount: 2, stakeAmount: 0, playerIds: ['p1', 'p2'] }).ok, false);
 });
 
-test('join client html propagates the request version into asset urls', async (t) => {
-  const app = express();
-  app.use(routes);
+test('session join route redirects to the hosted client with required launch params', async (t) => {
+  const previousClientBaseUrl = config.clientBaseUrl;
+  const originalGetOrHydrate = sessionRegistry.getOrHydrate;
+  config.clientBaseUrl = 'https://client.example.test/play';
+  sessionRegistry.getOrHydrate = async () => ({
+    session: { sessionId: 'test-session', status: SessionStatus.WAITING_FOR_FIRST_JOIN },
+    round: { roundId: 'round-1', status: RoundStatus.WAITING_FOR_FIRST_JOIN },
+    players: [],
+    boxes: []
+  });
 
+  const app = createTestApp();
   const server = http.createServer(app);
   await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
   t.after(async () => {
+    config.clientBaseUrl = previousClientBaseUrl;
+    sessionRegistry.getOrHydrate = originalGetOrHydrate;
     await new Promise((resolve) => server.close(resolve));
   });
 
   const address = server.address();
   const port = typeof address === 'object' && address ? address.port : 0;
-  const response = await fetch(`http://127.0.0.1:${port}/session/test-session/join?v=run-123`);
-  const html = await response.text();
+  const response = await fetch(
+    `http://127.0.0.1:${port}/session/test-session/join?playerId=p1&playerName=Alice`,
+    { redirect: 'manual' }
+  );
 
-  assert.equal(response.status, 200);
-  assert.match(html, /\/src\/style\.css\?v=run-123/);
-  assert.match(html, /\/src\/main\.js\?v=run-123/);
-  assert.equal(response.headers.get('cache-control'), 'no-store, no-cache, must-revalidate, proxy-revalidate');
+  assert.equal(response.status, 302);
+  assert.equal(
+    response.headers.get('location'),
+    `https://client.example.test/play?joinUrl=http%3A%2F%2F127.0.0.1%3A${port}%2Fsession%2Ftest-session%2Fjoin&sessionId=test-session&ws=ws%3A%2F%2F127.0.0.1%3A${port}&playerId=p1&playerName=Alice`
+  );
+});
+
+test('session join route truncates player names in launch redirects', async (t) => {
+  const previousClientBaseUrl = config.clientBaseUrl;
+  const originalGetOrHydrate = sessionRegistry.getOrHydrate;
+  config.clientBaseUrl = 'https://client.example.test/play';
+  sessionRegistry.getOrHydrate = async () => ({
+    session: { sessionId: 'test-session', status: SessionStatus.WAITING_FOR_FIRST_JOIN },
+    round: { roundId: 'round-1', status: RoundStatus.WAITING_FOR_FIRST_JOIN },
+    players: [],
+    boxes: []
+  });
+
+  const app = createTestApp();
+  const server = http.createServer(app);
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  t.after(async () => {
+    config.clientBaseUrl = previousClientBaseUrl;
+    sessionRegistry.getOrHydrate = originalGetOrHydrate;
+    await new Promise((resolve) => server.close(resolve));
+  });
+
+  const address = server.address();
+  const port = typeof address === 'object' && address ? address.port : 0;
+  const response = await fetch(
+    `http://127.0.0.1:${port}/session/test-session/join?playerId=p1&playerName=Extra%20Long%20Player%20Name`,
+    { redirect: 'manual' }
+  );
+
+  assert.equal(response.status, 302);
+  assert.match(response.headers.get('location') || '', /playerName=Extra(?:\+|%20)Long(?:\+|%20)Play$/);
+});
+
+test('session start returns a signed response when control auth succeeds', async (t) => {
+  const previousControlToken = config.controlApiToken;
+  const previousHmacSecret = config.hmacSecret;
+  const originalCreateSession = sessionRegistry.createSession;
+  config.controlApiToken = 'secret-token';
+  config.hmacSecret = 'test-hmac-secret';
+  sessionRegistry.createSession = async () => ({
+    session: {
+      sessionId: 'session-created',
+      initialExpectedPlayerCount: 2,
+      currentExpectedPlayerCount: 2,
+      stakeAmount: 1000,
+      platformFeeType: 'percentage',
+      platformFeeValueSnapshot: 10,
+      registeredPlayerIds: ['p1', 'p2'],
+      roundCount: 1,
+      currentRoundId: 'round-1',
+      status: SessionStatus.WAITING_FOR_FIRST_JOIN
+    },
+    round: { roundId: 'round-1', roundNumber: 1, expectedPlayerCountForRound: 2 },
+    players: createRoundPlayers(['p1', 'p2'])
+  });
+
+  const app = createTestApp();
+  const server = http.createServer(app);
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+
+  t.after(async () => {
+    config.controlApiToken = previousControlToken;
+    config.hmacSecret = previousHmacSecret;
+    sessionRegistry.createSession = originalCreateSession;
+    await new Promise((resolve) => server.close(resolve));
+  });
+
+  const address = server.address();
+  const port = typeof address === 'object' && address ? address.port : 0;
+  const response = await fetch(`http://127.0.0.1:${port}/session/start`, {
+    method: 'POST',
+    headers: {
+      authorization: 'Bearer secret-token',
+      'content-type': 'application/json'
+    },
+    body: JSON.stringify({
+      playerCount: 2,
+      stakeAmount: 1000,
+      playerIds: ['p1', 'p2']
+    })
+  });
+  const payload = await response.json();
+
+  assert.equal(response.status, 201);
+  assert.equal(payload.sessionId, 'session-created');
+  assert.equal(payload.playerCount, 2);
+  assert.match(response.headers.get('x-hub-signature-256') || '', /^[a-f0-9]{64}$/);
+});
+
+test('session start rejects unauthorized requests when control auth is configured', async (t) => {
+  const previousControlToken = config.controlApiToken;
+  config.controlApiToken = 'secret-token';
+
+  const app = createTestApp();
+  const server = http.createServer(app);
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+
+  t.after(async () => {
+    config.controlApiToken = previousControlToken;
+    await new Promise((resolve) => server.close(resolve));
+  });
+
+  const address = server.address();
+  const port = typeof address === 'object' && address ? address.port : 0;
+  const response = await fetch(`http://127.0.0.1:${port}/session/start`, {
+    method: 'POST',
+    headers: {
+      'content-type': 'application/json'
+    },
+    body: JSON.stringify({
+      playerCount: 2,
+      stakeAmount: 1000,
+      playerIds: ['p1', 'p2']
+    })
+  });
+  const payload = await response.json();
+
+  assert.equal(response.status, 401);
+  assert.equal(payload.error, 'Unauthorized');
+});
+
+test('replay contract rejects requests with fewer than 2 players', async (t) => {
+  const previousControlToken = config.controlApiToken;
+  config.controlApiToken = 'secret-token';
+
+  const app = createTestApp();
+  const server = http.createServer(app);
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+
+  t.after(async () => {
+    config.controlApiToken = previousControlToken;
+    await new Promise((resolve) => server.close(resolve));
+  });
+
+  const address = server.address();
+  const port = typeof address === 'object' && address ? address.port : 0;
+  const response = await fetch(`http://127.0.0.1:${port}/session/session-1/replay`, {
+    method: 'POST',
+    headers: {
+      authorization: 'Bearer secret-token',
+      'content-type': 'application/json'
+    },
+    body: JSON.stringify({
+      playerIds: ['p1']
+    })
+  });
+  const payload = await response.json();
+
+  assert.equal(response.status, 400);
+  assert.equal(payload.error, 'Replay requires at least 2 unique players');
 });
 
 test('public session endpoint hides audit seed and box rewards before reveal', async (t) => {
@@ -87,8 +256,7 @@ test('public session endpoint hides audit seed and box rewards before reveal', a
     ]
   });
 
-  const app = express();
-  app.use(routes);
+  const app = createTestApp();
 
   const server = http.createServer(app);
   await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
@@ -108,13 +276,13 @@ test('public session endpoint hides audit seed and box rewards before reveal', a
   assert.equal('isWinningBox' in payload.boxes[0], false);
 });
 
-test('public session endpoint includes reveal data after reveal begins', async (t) => {
+test('public session endpoint includes reveal data after round end', async (t) => {
   const originalGetOrHydrate = sessionRegistry.getOrHydrate;
   sessionRegistry.getOrHydrate = async () => ({
     session: { sessionId: 'session-1', status: SessionStatus.REPLAY_WAITING },
     round: {
       roundId: 'round-1',
-      status: RoundStatus.REVEALING,
+      status: RoundStatus.ROUND_ENDED,
       auditSeed: 'seed-visible'
     },
     players: [{ playerId: 'p1', isConnected: true }],
@@ -130,8 +298,7 @@ test('public session endpoint includes reveal data after reveal begins', async (
     ]
   });
 
-  const app = express();
-  app.use(routes);
+  const app = createTestApp();
 
   const server = http.createServer(app);
   await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
@@ -149,133 +316,6 @@ test('public session endpoint includes reveal data after reveal begins', async (
   assert.equal(payload.round.auditSeed, 'seed-visible');
   assert.equal(payload.boxes[0].rewardAmount, 2700);
   assert.equal(payload.boxes[0].isWinningBox, true);
-});
-
-test('buildSessionSnapshot exposes 2D timings before reveal and full results after reveal', () => {
-  const session = createSessionContainer({
-    playerCount: 5,
-    stakeAmount: 1000,
-    playerIds: ['p1', 'p2', 'p3', 'p4', 'p5'],
-    platformFeeType: 'percentage',
-    platformFeeValue: 10
-  });
-  const round = createRound({
-    sessionId: session.sessionId,
-    roundNumber: 1,
-    playerIds: session.registeredPlayerIds
-  });
-  const players = createRoundPlayers(session.registeredPlayerIds);
-
-  players[0].playerName = 'Alice';
-  players[0].hasJoinedRound = true;
-  players[0].currentBoxId = 'b1';
-  players[0].initialBoxId = 'b1';
-  players[0].initialBoxNumber = 1;
-  players[0].swapState = SwapState.MATCHED;
-
-  players[1].playerName = 'Bob';
-  players[1].hasJoinedRound = true;
-  players[1].currentBoxId = 'b2';
-  players[1].initialBoxId = 'b2';
-  players[1].initialBoxNumber = 2;
-  players[1].swapState = SwapState.KEPT;
-
-  const boxes = [
-    { boxId: 'b1', boxNumber: 1, currentOwnerPlayerId: 'p1', rewardAmount: 0, isWinningBox: false },
-    { boxId: 'b2', boxNumber: 2, currentOwnerPlayerId: 'p2', rewardAmount: 2700, isWinningBox: true }
-  ];
-
-  round.status = RoundStatus.SWAP_OPEN;
-  round.distributionStartedAt = 1000;
-  round.distributionEndsAt = 4000;
-  round.swapStartedAt = 4000;
-  round.swapActionClosesAt = 6100;
-  round.swapEndsAt = 7000;
-
-  const preReveal = buildSessionSnapshot({ session, round, players, boxes, playerId: 'p1' });
-  assert.equal(preReveal.you.initialBoxNumber, 1);
-  assert.equal(preReveal.you.currentBoxNumber, 1);
-  assert.equal(preReveal.you.hasRevealOccurred, false);
-  assert.equal(preReveal.you.result, null);
-  assert.equal(preReveal.roundResults, null);
-  assert.equal(preReveal.distributionStartedAt, 1000);
-  assert.equal(preReveal.swapActionClosesAt, 6100);
-  assert.equal('sceneGateEndsAt' in preReveal, false);
-  assert.equal('readyEndsAt' in preReveal, false);
-  assert.equal('sceneTrack' in preReveal, false);
-  assert.equal('sceneLoadState' in preReveal.you, false);
-  assert.equal('readyState' in preReveal.you, false);
-
-  players[0].finalBoxId = 'b2';
-  players[0].finalBoxNumber = 2;
-  players[0].finalPrizeAmount = 2700;
-  players[0].isWinner = true;
-
-  players[1].finalBoxId = 'b1';
-  players[1].finalBoxNumber = 1;
-  players[1].finalPrizeAmount = 0;
-  players[1].isWinner = false;
-
-  round.status = RoundStatus.ROUND_ENDED;
-  round.rewardPool = 4500;
-  round.grossStakeTotal = 5000;
-  round.feeAmount = 500;
-  round.winnerCount = 1;
-
-  const postReveal = buildSessionSnapshot({ session, round, players, boxes, playerId: 'p1' });
-  assert.equal(postReveal.you.hasRevealOccurred, true);
-  assert.deepEqual(postReveal.you.result, {
-    playerId: 'p1',
-    playerName: 'Alice',
-    initialBoxNumber: 1,
-    finalBoxNumber: 2,
-    wasSwapped: true,
-    isWinner: true,
-    prizeAmount: 2700
-  });
-  assert.equal(postReveal.roundResults.allPlayers.length, 2);
-  assert.equal(postReveal.roundResults.winnerList.length, 1);
-  assert.equal(postReveal.roundResults.loserList.length, 1);
-  assert.equal(postReveal.roundResults.allPlayers[0].playerId, 'p1');
-});
-
-test('buildSessionSnapshot keeps reveal barrier timing fields available before final results release', () => {
-  const session = createSessionContainer({
-    playerCount: 5,
-    stakeAmount: 1000,
-    playerIds: ['p1', 'p2', 'p3', 'p4', 'p5'],
-    platformFeeType: 'percentage',
-    platformFeeValue: 10
-  });
-  const round = createRound({
-    sessionId: session.sessionId,
-    roundNumber: 1,
-    playerIds: session.registeredPlayerIds
-  });
-  const players = createRoundPlayers(session.registeredPlayerIds);
-  const boxes = [{ boxId: 'b1', boxNumber: 1, currentOwnerPlayerId: 'p1', rewardAmount: 0, isWinningBox: false }];
-
-  players[0].playerName = 'Alice';
-  players[0].hasJoinedRound = true;
-  players[0].currentBoxId = 'b1';
-  players[0].initialBoxId = 'b1';
-  players[0].initialBoxNumber = 1;
-  players[0].swapState = SwapState.KEPT;
-
-  round.status = RoundStatus.REVEALING;
-  round.revealAt = 7100;
-  round.preResultStartedAt = 7100;
-  round.preResultReadyDeadlineAt = 13100;
-  round.finalResultsReleaseAt = null;
-
-  const snapshot = buildSessionSnapshot({ session, round, players, boxes, playerId: 'p1' });
-
-  assert.equal(snapshot.revealAt, 7100);
-  assert.equal(snapshot.preResultStartedAt, 7100);
-  assert.equal(snapshot.preResultReadyDeadlineAt, 13100);
-  assert.equal(snapshot.finalResultsReleaseAt, null);
-  assert.equal(snapshot.you.hasRevealOccurred, false);
-  assert.equal(snapshot.roundResults, null);
 });
 
 test('buildSessionCreatedPayload normalizes session bootstrap details', () => {
@@ -332,7 +372,9 @@ test('buildRoundStartedPayload includes normalized economy, players, and boxes',
     feeAmount: 500,
     rewardPool: 4500,
     distributionStartedAt: 1000,
-    distributionEndsAt: 4000
+    distributionEndsAt: 4000,
+    distributionPackage: { phase: 'distribution' },
+    swapPackage: { phase: 'swap' }
   };
   const players = [
     {
@@ -396,6 +438,8 @@ test('buildRoundStartedPayload includes normalized economy, players, and boxes',
   assert.equal(payload.players.length, 2);
   assert.equal(payload.boxes.length, 2);
   assert.equal(payload.distributionStartedAt, 1000);
+  assert.equal(payload.distributionPackage.phase, 'distribution');
+  assert.equal(payload.swapPackage.phase, 'swap');
 });
 
 test('buildRoundSwapMatchedPayload includes before and after box ownership summaries', () => {
@@ -454,9 +498,6 @@ test('buildRoundEndedPayload includes winners, losers, platform fee, and swap su
     swapActionClosesAt: 6100,
     swapEndsAt: 7000,
     swapClosedAt: 7100,
-    revealAt: 7100,
-    preResultStartedAt: 7100,
-    preResultReadyDeadlineAt: 13100,
     finalResultsReleaseAt: 14300,
     finalResultsSentAt: 14350,
     endedAt: 14350,
@@ -570,53 +611,24 @@ test('buildSessionEndedPayload stays lightweight and references only the last ro
   assert.equal('boxes' in payload, false);
 });
 
-test('validateEnv accepts the current pre-result config and rejects invalid barrier timings', () => {
-  const previousReadyTimeout = config.preResultReadyTimeoutMs;
-  const previousHold = config.preResultHoldMs;
+test('validateEnv accepts the current timing config and rejects invalid distribution timings', () => {
+  const previousDistributionLead = config.distributionLeadMs;
+  const previousCalcDelay = config.calcDelayMs;
 
   try {
     assert.doesNotThrow(() => validateEnv());
-    assert.equal('revealPhaseMs' in config, false);
+    assert.equal('preResultReadyTimeoutMs' in config, false);
 
-    config.preResultReadyTimeoutMs = 0;
-    assert.throws(() => validateEnv(), /PRE_RESULT_READY_TIMEOUT_MS/);
+    config.distributionLeadMs = 0;
+    assert.throws(() => validateEnv(), /DISTRIBUTION_LEAD_MS/);
 
-    config.preResultReadyTimeoutMs = previousReadyTimeout;
-    config.preResultHoldMs = 0;
-    assert.throws(() => validateEnv(), /PRE_RESULT_HOLD_MS/);
+    config.distributionLeadMs = previousDistributionLead;
+    config.calcDelayMs = 0;
+    assert.throws(() => validateEnv(), /CALC_DELAY_MS/);
   } finally {
-    config.preResultReadyTimeoutMs = previousReadyTimeout;
-    config.preResultHoldMs = previousHold;
+    config.distributionLeadMs = previousDistributionLead;
+    config.calcDelayMs = previousCalcDelay;
   }
-});
-
-test('buildSessionSnapshot returns null player payload for unknown players', () => {
-  const snapshot = buildSessionSnapshot({
-    session: { sessionId: 's1', stakeAmount: 1000, status: SessionStatus.WAITING_FOR_FIRST_JOIN },
-    round: {
-      roundId: 'r1',
-      roundNumber: 1,
-      status: RoundStatus.WAITING_FOR_FIRST_JOIN,
-      joinDeadlineAt: null,
-      distributionStartedAt: null,
-      distributionEndsAt: null,
-      swapStartedAt: null,
-      swapActionClosesAt: null,
-      swapEndsAt: null,
-      swapClosedAt: null,
-      revealAt: null,
-      grossStakeTotal: null,
-      feeAmount: null,
-      rewardPool: null,
-      winnerCount: null
-    },
-    players: [],
-    boxes: [],
-    playerId: 'missing'
-  });
-
-  assert.equal(snapshot.you, null);
-  assert.equal(snapshot.summary.stakeAmount, 1000);
 });
 
 test('admin dlq routes list, inspect, resend, and clear items behind control auth', async (t) => {
@@ -627,8 +639,7 @@ test('admin dlq routes list, inspect, resend, and clear items behind control aut
   config.dlqDir = tempDir;
   config.controlApiToken = 'secret-token';
 
-  const app = express();
-  app.use(routes);
+  const app = createTestApp();
   const server = http.createServer(app);
   await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
 

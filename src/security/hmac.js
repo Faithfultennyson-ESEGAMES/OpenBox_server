@@ -6,4 +6,3 @@ export function signJsonPayload(payload) {
   const body = typeof payload === 'string' ? payload : JSON.stringify(payload);
   return crypto.createHmac('sha256', config.hmacSecret).update(body).digest('hex');
 }
-

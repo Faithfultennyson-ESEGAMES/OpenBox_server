@@ -22,13 +22,21 @@ function setNoStoreHeaders(res) {
   res.setHeader('Surrogate-Control', 'no-store');
 }
 
+function isAllowedOrigin(requestOrigin) {
+  if (!requestOrigin) return true;
+  if (!config.clientOrigins.length) return true;
+  return config.clientOrigins.includes(requestOrigin);
+}
+
 app.use((req, res, next) => {
   const requestOrigin = req.get('origin') || '';
-  const allowOrigin = config.clientOrigins.length > 0
-    ? config.clientOrigins.includes(requestOrigin)
-    : !!requestOrigin;
 
-  if (allowOrigin && requestOrigin) {
+  if (requestOrigin && !isAllowedOrigin(requestOrigin)) {
+    res.status(403).json({ error: 'Origin not allowed' });
+    return;
+  }
+
+  if (requestOrigin) {
     res.setHeader('Access-Control-Allow-Origin', requestOrigin);
     res.setHeader('Vary', 'Origin');
     res.setHeader('Access-Control-Allow-Credentials', 'true');
@@ -44,21 +52,19 @@ app.use((req, res, next) => {
 
   next();
 });
+
 app.use(express.json());
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const clientRoot = path.resolve(__dirname, '../../client/public');
+const clientRoot = path.resolve(__dirname, '../public');
 
-app.use('/src', express.static(path.join(clientRoot, 'src'), {
-  etag: false,
-  lastModified: false,
-  setHeaders: setNoStoreHeaders
-}));
-app.use('/assets', express.static(path.join(clientRoot, 'assets'), {
-  etag: false,
-  lastModified: false,
-  setHeaders: setNoStoreHeaders
-}));
+app.use(
+  express.static(clientRoot, {
+    etag: false,
+    lastModified: false,
+    setHeaders: setNoStoreHeaders
+  })
+);
 app.use(routes);
 app.use((error, req, res, next) => {
   console.error('[HTTP]', error);
@@ -76,7 +82,8 @@ const server = http.createServer(app);
 const wss = new WebSocketServer({ server });
 
 wss.on('connection', async (ws, req) => {
-  if (config.clientOrigins.length > 0 && req.headers.origin && !config.clientOrigins.includes(req.headers.origin)) {
+  const requestOrigin = req.headers.origin || '';
+  if (!isAllowedOrigin(requestOrigin)) {
     ws.close(1008, 'Origin not allowed');
     return;
   }
@@ -158,7 +165,7 @@ async function main() {
   }
 
   server.listen(config.port, () => {
-    console.log(`Open Box server listening on ${config.port}`);
+    console.log(`Open Box game server listening on ${config.port}`);
   });
 }
 
