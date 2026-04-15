@@ -51,7 +51,7 @@ test('validateStartPayload rejects invalid player counts, mismatches, duplicates
   assert.equal(validateStartPayload({ playerCount: 2, stakeAmount: 0, playerIds: ['p1', 'p2'] }).ok, false);
 });
 
-test('session join route redirects to the hosted client with required launch params', async (t) => {
+test('session join route redirects to the hosted client without requiring ws launch params', async (t) => {
   const previousClientBaseUrl = config.clientBaseUrl;
   const originalGetOrHydrate = sessionRegistry.getOrHydrate;
   config.clientBaseUrl = 'https://client.example.test/play';
@@ -81,7 +81,7 @@ test('session join route redirects to the hosted client with required launch par
   assert.equal(response.status, 302);
   assert.equal(
     response.headers.get('location'),
-    `https://client.example.test/play?joinUrl=http%3A%2F%2F127.0.0.1%3A${port}%2Fsession%2Ftest-session%2Fjoin&sessionId=test-session&ws=ws%3A%2F%2F127.0.0.1%3A${port}&playerId=p1&playerName=Alice`
+    `https://client.example.test/play?joinUrl=http%3A%2F%2F127.0.0.1%3A${port}%2Fsession%2Ftest-session%2Fjoin&sessionId=test-session&playerId=p1&playerName=Alice`
   );
 });
 
@@ -251,6 +251,60 @@ test('session start response keeps the initial waiting status even if runtime mu
 
   assert.equal(response.status, 201);
   assert.equal(payload.status, SessionStatus.WAITING_FOR_FIRST_JOIN);
+});
+
+test('api session helper returns a clientUrl that does not require ws launch params', async (t) => {
+  const originalCreateSession = sessionRegistry.createSession;
+  const previousClientBaseUrl = config.clientBaseUrl;
+  config.clientBaseUrl = 'https://client.example.test/play';
+  sessionRegistry.createSession = async () => ({
+    session: {
+      sessionId: 'session-created',
+      initialExpectedPlayerCount: 2,
+      currentExpectedPlayerCount: 2,
+      stakeAmount: 1000,
+      platformFeeType: 'percentage',
+      platformFeeValueSnapshot: 10,
+      registeredPlayerIds: ['p1', 'p2'],
+      roundCount: 1,
+      currentRoundId: 'round-1',
+      status: SessionStatus.WAITING_FOR_FIRST_JOIN
+    },
+    round: { roundId: 'round-1', roundNumber: 1, expectedPlayerCountForRound: 2 },
+    players: createRoundPlayers(['p1', 'p2'])
+  });
+
+  const app = createTestApp();
+  const server = http.createServer(app);
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+
+  t.after(async () => {
+    sessionRegistry.createSession = originalCreateSession;
+    config.clientBaseUrl = previousClientBaseUrl;
+    await new Promise((resolve) => server.close(resolve));
+  });
+
+  const address = server.address();
+  const port = typeof address === 'object' && address ? address.port : 0;
+  const response = await fetch(`http://127.0.0.1:${port}/api/sessions`, {
+    method: 'POST',
+    headers: {
+      'content-type': 'application/json'
+    },
+    body: JSON.stringify({
+      playerCount: 2,
+      stakeAmount: 1000,
+      playerIds: ['p1', 'p2']
+    })
+  });
+  const payload = await response.json();
+
+  assert.equal(response.status, 201);
+  assert.equal(
+    payload.clientUrl,
+    `https://client.example.test/play?joinUrl=http%3A%2F%2F127.0.0.1%3A${port}%2Fsession%2Fsession-created%2Fjoin&sessionId=session-created`
+  );
+  assert.equal(payload.wsUrl, `ws://127.0.0.1:${port}`);
 });
 
 test('session start rejects unauthorized requests when control auth is configured', async (t) => {

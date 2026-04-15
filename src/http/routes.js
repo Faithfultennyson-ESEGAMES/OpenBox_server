@@ -38,7 +38,6 @@ function buildClientLaunchUrl(req, sessionId, query = {}) {
   const url = new URL(config.clientBaseUrl);
   url.searchParams.set('joinUrl', buildServerJoinUrl(req, sessionId));
   url.searchParams.set('sessionId', sessionId);
-  url.searchParams.set('ws', buildWsUrl(req));
 
   for (const [key, value] of Object.entries(query)) {
     if (value == null || value === '') continue;
